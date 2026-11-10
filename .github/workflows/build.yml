@@ -2,10 +2,10 @@
 name: Build Geode Mod
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - "**"
-  workflow_dispatch:
 
 jobs:
   build:
@@ -35,13 +35,18 @@ jobs:
     runs-on: ${{ matrix.config.os }}
 
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout source
+        uses: actions/checkout@v7
 
-      - name: Build mod
+      - name: Build the mod
         uses: geode-sdk/build-geode-mod@main
         with:
           combine: true
           target: ${{ matrix.config.target }}
+
+          # Use the 2.2081 FMOD bindings fix for iOS
+          bindings: ${{ matrix.config.name == 'iOS' && 'vwtfafa/bindings' || 'geode-sdk/bindings' }}
+          bindings-ref: ${{ matrix.config.name == 'iOS' && 'fix/2.2081-depends' || '' }}
 
   package:
     name: Package builds
@@ -49,10 +54,12 @@ jobs:
     needs: [build]
 
     steps:
-      - uses: geode-sdk/build-geode-mod/combine@main
+      - name: Combine platform builds
         id: build
+        uses: geode-sdk/build-geode-mod/combine@main
 
-      - uses: actions/upload-artifact@v7
+      - name: Upload combined mod
+        uses: actions/upload-artifact@v7
         with:
           name: Build Output
           path: ${{ steps.build.outputs.build-output }}
