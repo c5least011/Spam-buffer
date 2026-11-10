@@ -1,0 +1,22 @@
+{
+	"geode": "5.11.2",
+	"gd": {
+		"win": "2.2081",
+		"android": "2.2081",
+		"mac": "2.2081",
+		"ios": "2.2081"
+	},
+	"id": "c5least.spam-buffer",
+	"name": "Spam Buffer(experimental)",
+	"version": "v1.0.0-beta",
+	"developer": "C5least",
+	"description": "In-game spam assistance",
+	"dependencies": {},
+  	"incompatibilities": 
+    {
+      "id": "c5least.input-buffer",
+      "version": ">=1.0.0",
+      "importance": "breaking"
+    }
+
+}
