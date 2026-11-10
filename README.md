@@ -1,5 +1,5 @@
 # SpamBuffer
-This is where she makes a mod.
+A mod that make you become a god spammer
 
 <img src="logo.png" width="150" alt="the mod's logo" />
 
