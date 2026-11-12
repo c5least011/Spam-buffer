@@ -12,11 +12,12 @@
 	"developer": "C5least",
 	"description": "In-game spam assistance",
 	"dependencies": {},
-  	"incompatibilities": 
-    {
-      "id": "c5least.input-buffer",
-      "version": ">=v1.0.0",
-      "importance": "breaking"
-    }
+  	"incompatibilities": [
+  {
+    "id": "c5least.input-buffer",
+    "version": ">=v1.0.0",
+    "importance": "breaking"
+  }
+]
 
 }
