@@ -146,6 +146,7 @@ private:
     float m_stepDtNow = 0.f;
     long m_dbgRingSeen = 0;            // orbs the ghost touched
     long m_dbgRingHit = 0;             // ...that reacted to the clicked tick
+    std::deque<float> m_yHist[2];      // recent real ship / player heights, one per tick
     long m_dbgBlueHit = 0;             // ...of which blue (gravity) orbs
     float m_blueX = 0.f;               // x of the last blue orb the ghost activated
     long m_dbgOrbDelays = 0;           // delays that were chosen because of an orb
@@ -257,6 +258,8 @@ public:
     }
 
     void onReset() { // level restart / respawn
+        m_yHist[0].clear();
+        m_yHist[1].clear();
         for (int i = 0; i < 2; ++i) {
             m_pend[i].clear();
             m_supp[i] = false;
@@ -313,6 +316,11 @@ public:
         PlayerObject* po = pi == 0 ? pl->m_player1 : pl->m_player2;
         if (!po || po->m_isDead || detectMode(po) != M_WAVE) return 0;
         if (c.maxDelay[M_WAVE] <= 0) return 0;
+        // Noclip: a death was just blocked, so the real player may sit inside geometry
+        // and the ghost has no meaningful path to protect: let the input through.
+        if (m_noclipTicks > 0) return 0;
+        // Slopes: the ghost does not predict them reliably, a "delay" there is a guess.
+        if (po->m_isOnSlope || po->m_wasOnSlope) return 0;
         m_game[0] = game0;
         m_game[1] = game1;
         if (lay == Layout::Solo) m_game[0] = laneGame;
@@ -322,6 +330,141 @@ public:
         if (!d.known || d.drop || d.delay <= 0) return 0;
         ++m_dbgDelayed;
         return d.delay;
+    }
+
+
+    // ------------------------------------------------------------- ship spam
+    // Ship spam is a straight line (flat, up or down). The wave buffer asks "which
+    // delay SURVIVES"; for a ship that is the wrong question: a gap, a notch or a spike
+    // box can make a sloppy path look safe and drag the ship off its line. So here:
+    //   * the line is the ship's own recent average motion (through where it is now);
+    //   * every delay is simulated with the player's spam rhythm going on (not a long
+    //     constant hold), and scored by how far it strays from that line;
+    //   * a delay is used only if the ship is in danger (dies soon) and a delay that
+    //     survives AND stays close to the line exists. Otherwise the input passes
+    //     untouched: it never chases a gap away from the line.
+    // `half` = half a click cycle of the player's spam, in ticks.
+    // Returns the number of ticks to hold the press / release back (0 = pass).
+    int sbShipDelay(PlayLayer* pl, bool isP1, bool push, bool game0, bool game1, bool laneGame, int half) {
+        auto& c = cfg();
+        if (!pl || !m_ready || !c.enabled) return 0;
+        int frames = static_cast<int>(CCDirector::sharedDirector()->getTotalFrames());
+        if (frames - m_lastTickFrame > c.failOpen) return 0;      // fail-open
+        Layout lay = layoutOf(pl);
+        m_layout = lay;
+        if (lay == Layout::TwoPlayer && !c.twoPlayerMode) return 0;
+        if (lay == Layout::DualSolo && !c.dualSupport) return 0;
+        int pi = (lay != Layout::Solo && !isP1) ? 1 : 0;
+        PlayerObject* po = pi == 0 ? pl->m_player1 : pl->m_player2;
+        if (!po || po->m_isDead || detectMode(po) != M_SHIP) return 0;
+        const int maxDelay = c.maxDelay[M_SHIP];
+        if (maxDelay <= 0) return 0;
+        if (m_noclipTicks > 0) return 0;                          // noclip: no real line to protect
+        if (po->m_isOnSlope || po->m_wasOnSlope) return 0;        // slopes: not predicted reliably
+        if (m_load > 4.f) return 0;                               // busy
+
+        m_game[0] = game0;
+        m_game[1] = game1;
+        if (lay == Layout::Solo) m_game[0] = laneGame;
+        m_otherOverride = (lay == Layout::DualSolo) ? (push ? 1 : 0) : -1;
+
+        const int H = std::max(12, c.shipHorizon);
+        half = clampi(half, 2, 12);
+        const int imminent = c.shipImminent;
+
+        // the straight line: through the ship now, with its recent mean slope
+        float slope = 0.f;
+        auto& hist = m_yHist[pi];
+        if (hist.size() >= 10) {
+            int n = std::min<int>(int(hist.size()) - 1, 32);
+            slope = (hist.back() - hist[hist.size() - 1 - n]) / float(n);
+        }
+        const float y0 = po->getPositionY();
+
+        constexpr float kOkDev = 18.f;      // mean distance from the line that still counts as straight
+        constexpr float kMaxDev = 60.f;     // a delay that strays further than this is never taken
+        constexpr float kBetter = 8.f;      // and it must be at least this much straighter
+
+        struct Cand { bool alive = false; float dev = 0.f; int reach = 0; };
+        std::vector<Cand> cand;
+        cand.reserve(maxDelay + 1);
+
+        beginSearch(pl, pi);
+        loadReal(0);
+        float waitSum = 0.f;
+        int waitN = 0;
+        for (int d = 0; d <= maxDelay; ++d) {
+            if (d > 0) {
+                if (!step(0, m_game[pi])) {                   // waiting longer is deadly too
+                    noteDeath(0);
+                    break;
+                }
+                if (m_info[0].unknown) break;
+                float y = m_p[m_tp][0]->getPositionY();
+                waitSum += std::fabs(y - (y0 + slope * float(d)));
+                ++waitN;
+            }
+            copySlot(1, 0);
+            Cand cd;
+            cd.alive = true;
+            cd.reach = d;
+            float sum = waitSum;
+            int n = waitN;
+            bool hold = push;
+            int since = 0;
+            for (int t = d; t < H; ++t) {
+                if (!step(1, hold)) {
+                    noteDeath(1);
+                    cd.alive = false;
+                    break;
+                }
+                if (m_info[1].unknown) break;
+                float y = m_p[m_tp][1]->getPositionY();
+                sum += std::fabs(y - (y0 + slope * float(t + 1)));
+                ++n;
+                ++cd.reach;
+                if (++since >= half) {                        // the spam goes on at its own rhythm
+                    hold = !hold;
+                    since = 0;
+                }
+            }
+            cd.dev = n > 0 ? sum / float(n) : 0.f;
+            cand.push_back(cd);
+            if (m_aborted) break;
+        }
+
+        int delay = 0;
+        const char* why = "pass";
+        if (!m_aborted && !cand.empty()) {
+            const Cand& now = cand[0];
+            if (now.alive && now.dev <= kOkDev) {
+                why = "straight";                             // on the line and safe: leave it alone
+            } else if (!now.alive && now.reach < 2) {
+                why = "out-of-sync";                          // dies at once: the ghost cannot be trusted
+            } else if (!now.alive && now.reach >= imminent) {
+                why = "not-imminent";
+            } else {
+                int best = -1;
+                for (int d = 1; d < int(cand.size()); ++d) {
+                    if (!cand[d].alive || cand[d].dev > kMaxDev) continue;
+                    if (best < 0 || cand[d].dev < cand[best].dev - 1.f) best = d;
+                }
+                if (best > 0 && (!now.alive || now.dev - cand[best].dev >= kBetter)) {
+                    delay = best;
+                    why = "DELAY";
+                } else {
+                    why = "no-straight-way";                  // nothing keeps the line: do not chase a gap
+                }
+            }
+        }
+        ++m_dbgSearches;
+        m_lastText = fmt::format("P{} ship {} d={} {} dev0={:.0f} slope={:.2f} half={}{}", pi + 1,
+                                 push ? "hold" : "release", delay, why,
+                                 cand.empty() ? 0.f : cand[0].dev, slope, half, m_aborted ? " ABORT" : "");
+        endSearch();
+        m_otherOverride = -1;
+        if (delay > 0) ++m_dbgDelayed;
+        return delay;
     }
 
     // Per physics tick (replaces onTick: no autoplay, nothing is ever fired).
@@ -350,8 +493,16 @@ public:
             drawResult();
         }
         m_justDecided = false;
+        if (pl->m_player1) pushHist(0, pl->m_player1->getPositionY());
+        if (pl->m_player2) pushHist(1, pl->m_player2->getPositionY());
         overlayTick(pl);
         return true;
+    }
+
+    void pushHist(int who, float y) {
+        auto& h = m_yHist[who];
+        h.push_back(y);
+        if (h.size() > 64) h.pop_front();
     }
 
     // The engine's physics-tick clock. Wave delays are counted in these ticks and
@@ -1453,7 +1604,8 @@ private:
 
         int delay = 0;
         if (foundDelay > 0) delay = foundDelay;
-        else if (foundDelay < 0 && firstReach >= 0 && firstReach < imminent) delay = bestDelay;
+        else if (foundDelay < 0 && firstReach >= (mode == M_WAVE ? 2 : 0) && firstReach < imminent)
+            delay = bestDelay;   // wave: "dies at once" means the ghost is out of sync (noclip, slope...), not a real danger
 
         if (delay > 0 && !m_aborted) {
             r.known = true;
