@@ -8,7 +8,7 @@
 	},
 	"id": "c5least.spam-buffer",
 	"name": "Spam Buffer(experimental)",
-	"version": "v1.0.0-beta",
+	"version": "v1.0.1-beta",
 	"developer": "C5least",
 	"description": "In-game spam assistance",
 	"dependencies": {},
