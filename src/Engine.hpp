@@ -177,6 +177,7 @@ private:
     int m_bestLen = 0;
     int m_bestReach = -1;
     int m_noclipTicks = 0;             // >0: a death was recently blocked (noclip)
+    std::unordered_map<GameObject*, long> m_blocked;   // objects whose kill a noclip mod blocked -> tick
 
     float m_measuredDt = 0.25f;
     CCDrawNode* m_draw = nullptr;
@@ -208,6 +209,7 @@ public:
         m_draw->setZOrder(5000);
         pl->m_objectLayer->addChild(m_draw);
 
+        m_blocked.clear();
         m_dbgInputs = m_dbgSearches = m_dbgDelayed = 0;
         m_lastText = "-";
 
@@ -316,9 +318,6 @@ public:
         PlayerObject* po = pi == 0 ? pl->m_player1 : pl->m_player2;
         if (!po || po->m_isDead || detectMode(po) != M_WAVE) return 0;
         if (c.maxDelay[M_WAVE] <= 0) return 0;
-        // Noclip: a death was just blocked, so the real player may sit inside geometry
-        // and the ghost has no meaningful path to protect: let the input through.
-        if (m_noclipTicks > 0) return 0;
         // Slopes: the ghost does not predict them reliably, a "delay" there is a guess.
         if (po->m_isOnSlope || po->m_wasOnSlope) return 0;
         m_game[0] = game0;
@@ -359,7 +358,6 @@ public:
         if (!po || po->m_isDead || detectMode(po) != M_SHIP) return 0;
         const int maxDelay = c.maxDelay[M_SHIP];
         if (maxDelay <= 0) return 0;
-        if (m_noclipTicks > 0) return 0;                          // noclip: no real line to protect
         if (po->m_isOnSlope || po->m_wasOnSlope) return 0;        // slopes: not predicted reliably
         if (m_load > 4.f) return 0;                               // busy
 
@@ -493,6 +491,10 @@ public:
             drawResult();
         }
         m_justDecided = false;
+        if ((m_now & 31) == 0 && !m_blocked.empty()) {
+            for (auto it = m_blocked.begin(); it != m_blocked.end();)
+                it = (long(m_now) - it->second > 120) ? m_blocked.erase(it) : std::next(it);
+        }
         if (pl->m_player1) pushHist(0, pl->m_player1->getPositionY());
         if (pl->m_player2) pushHist(1, pl->m_player2->getPositionY());
         overlayTick(pl);
@@ -619,8 +621,15 @@ public:
     }
 
     // Ghost deaths are swallowed here. Real deaths are left to the game.
-    bool onSimDeath(PlayerObject* player) {
+    // A ghost "death". With noclip the real player sits inside objects whose kill was
+    // blocked; the ghost goes through those same objects (it would die at once in all
+    // of them otherwise) but still dies on everything else ahead.
+    bool onSimDeath(PlayerObject* player, GameObject* object = nullptr) {
         if (m_simulating && isSimPlayer(player)) {
+            if (object) {
+                auto it = m_blocked.find(object);
+                if (it != m_blocked.end() && long(m_now) - it->second <= 40) return true;
+            }
             m_simDead = true;
             return true;
         }
@@ -630,7 +639,7 @@ public:
     // Call after the game handled a REAL destroyPlayer. Only a death that
     // really happened resets the engine; one blocked by a noclip mod is
     // ignored (it used to desync the input state every frame inside a hazard).
-    void onRealDestroyed(PlayerObject* player) {
+    void onRealDestroyed(PlayerObject* player, GameObject* object = nullptr) {
         PlayLayer* pl = PlayLayer::get();
         if (!pl || !player || (player != pl->m_player1 && player != pl->m_player2)) return;
         if (player->m_isDead) {
@@ -638,6 +647,7 @@ public:
             onReset();
         } else {
             m_noclipTicks = cfg().noclipTicks;
+            if (object) m_blocked[object] = m_now;     // noclip: the real player passes through this one
         }
     }
 
