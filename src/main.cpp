@@ -32,17 +32,27 @@ using buf::g_engine;
 namespace sb {
 inline bool g_injecting = false;
 
-// Wave, Frame Perfect and Orb are mutually exclusive: turning one on turns the
-// other two off, so two assist engines can never fight over the same input.
-// "wave" / "fp" / "orb" selects the mode; on=false just switches it off.
+// Frame Perfect and the buffer modes (Wave, Ship) never run together: turning FP on
+// turns Wave / Ship off and the other way round. Wave and Ship can both be on: a
+// player is in only one gamemode at a time, so they never touch the same input.
+// "wave" / "ship" / "fp" selects the mode; on=false just switches it off.
 inline void setExclusiveMode(const char* mode, bool on) {
     auto* mod = Mod::get();
     auto& c = Core::get().cfg;
     const std::string m = mode;
-    c.wave = on && m == "wave";
-    c.fp = on && m == "fp";
+    if (m == "fp") {
+        c.fp = on;
+        if (on) c.wave = c.ship = false;
+    } else if (m == "wave") {
+        c.wave = on;
+        if (on) c.fp = false;
+    } else if (m == "ship") {
+        c.ship = on;
+        if (on) c.fp = false;
+    }
     c.orb = false;   // Orb assist: coming soon
     mod->setSavedValue("cfg.wave-enabled", c.wave);
+    mod->setSavedValue("cfg.ship-enabled", c.ship);
     mod->setSavedValue("cfg.fp-enabled", c.fp);
 }
 
@@ -61,12 +71,15 @@ static void refreshCfg() {
     // All user-facing configuration lives in this mod's saved data. The
     // Geode Settings page is intentionally unused.
     c.wave = mod->getSavedValue<bool>("cfg.wave-enabled", true);
+    c.ship = mod->getSavedValue<bool>("cfg.ship-enabled", false);
     c.fp = mod->getSavedValue<bool>("cfg.fp-enabled", false);
     c.orb = false;   // Orb assist: coming soon
     c.hud = mod->getSavedValue<bool>("cfg.hud-enabled", true);
     c.traj = mod->getSavedValue<bool>("cfg.traj-enabled", false);
     c.waveDelay = mod->getSavedValue<int>("cfg.wave-delay", 6);
     c.waveLook = mod->getSavedValue<int>("cfg.wave-look", 16);
+    c.shipDelay = mod->getSavedValue<int>("cfg.ship-delay", 4);
+    c.shipLook = mod->getSavedValue<int>("cfg.ship-look", 24);
     c.fpCps = mod->getSavedValue<float>("cfg.fp-cps", 30.f);
     c.tps = mod->getSavedValue<int>("cfg.tps", 240);
     c.fpSlowerCps = mod->getSavedValue<float>("cfg.fp-slower-cps", 3.f);
@@ -75,19 +88,23 @@ static void refreshCfg() {
     c.tps = std::clamp(c.tps, 30, 1000);
     c.fpCps = std::clamp(c.fpCps, 1.f, float(c.tps) * 0.5f);
     c.fpSlowerCps = std::clamp(c.fpSlowerCps, 0.f, std::max(0.f, c.fpCps - 0.1f));
-    if (c.fp) { c.wave = false; c.orb = false; }
-    else if (c.wave) { c.orb = false; }
+    if (c.fp) { c.wave = false; c.ship = false; }
+    c.orb = false;
 
     c.waveDelay = std::clamp(c.waveDelay, 0, 8);
     c.waveLook = std::clamp(c.waveLook, 13, 18);
+    c.shipDelay = std::clamp(c.shipDelay, 0, 8);
+    c.shipLook = std::clamp(c.shipLook, 12, 36);
     c.orbLookahead = std::clamp(c.orbLookahead, 10, 120);
 
     // Ghost-player engine (wave buffer). Imminent is fixed at 8; delay 0 = off.
     auto& b = buf::cfg();
-    b.enabled = c.wave || c.orb;
+    b.enabled = c.wave || c.ship || c.orb;
     b.orbDetect = true;
     b.tapTicks = Cfg::orbTap;
     b.maxDelay[buf::M_WAVE] = c.waveDelay;
+    b.maxDelay[buf::M_SHIP] = c.shipDelay;
+    b.shipHorizon = c.shipLook;
     b.waveHorizon = c.waveLook;
     b.waveImminent = Cfg::waveImminent;
     b.showTrajectory = c.traj;
@@ -154,7 +171,7 @@ protected:
         m_mainLayer->addChild(m_content, 5);
 
         auto& c = sb::Core::get().cfg;
-        s_tab = c.fp ? 1 : (c.orb ? 2 : 0);
+        s_tab = c.fp ? 2 : ((c.ship && !c.wave) ? 1 : 0);
         build();
         return true;
     }
@@ -241,12 +258,12 @@ protected:
         menu->setPosition({0.f, 0.f});
         m_content->addChild(menu, 2);
 
-        // --- the three assist modes (only one can be on); also picks the settings below
-        const char* names[3] = {"WAVE", "FRAME PERFECT", "ORB SOON"};
-        const bool states[3] = {c.wave, c.fp, false};
-        const float px[3] = {52.f, 135.f, 218.f};
-        for (int i = 0; i < 3; ++i) {
-            auto* item = makePill(names[i], menu_selector(SBConfigPopup::onToggle), states[i], 76.f);
+        // --- the assist modes; each pill also picks the settings shown below
+        const char* names[4] = {"WAVE", "SHIP", "FP", "ORB"};
+        const bool states[4] = {c.wave, c.ship, c.fp, false};
+        const float px[4] = {35.f, 99.f, 163.f, 227.f};
+        for (int i = 0; i < 4; ++i) {
+            auto* item = makePill(names[i], menu_selector(SBConfigPopup::onToggle), states[i], 58.f);
             item->setTag(i);
             item->setPosition({px[i], 134.f});
             menu->addChild(item);
@@ -277,7 +294,24 @@ protected:
             addLabel(fmt::format("Imminent: {} (fixed)", sb::Cfg::waveImminent), {135.f, 50.f}, 0.36f,
                      ccc3(180, 180, 180));
         } else if (s_tab == 1) {
-            addInput({50.f, 80.f}, "Target CPS", fmt::format("{:.1f}", c.fpCps), true,
+            addInput({70.f, 80.f}, "Delay (0-12)", std::to_string(c.shipDelay), false,
+                     [](std::string const& s) {
+                         int v;
+                         if (!sb::parseInt(s, v)) return;
+                         Mod::get()->setSavedValue("cfg.ship-delay", std::clamp(v, 0, 8));
+                         sb::refreshCfg();
+                     });
+            addInput({200.f, 80.f}, "Look (12-36)", std::to_string(c.shipLook), false,
+                     [](std::string const& s) {
+                         int v;
+                         if (!sb::parseInt(s, v)) return;
+                         Mod::get()->setSavedValue("cfg.ship-look", std::clamp(v, 12, 36));
+                         sb::refreshCfg();
+                     });
+            addLabel("Straight-line spam: keeps the line", {135.f, 50.f}, 0.34f,
+                     ccc3(180, 180, 180));
+        } else if (s_tab == 2) {
+            addInput({50.f, 80.f}, "CPS", fmt::format("{:.1f}", c.fpCps), true,
                      [](std::string const& s) {
                          float v;
                          if (!sb::parseFloat(s, v)) return;
@@ -292,27 +326,26 @@ protected:
                          Mod::get()->setSavedValue("cfg.fp-slower-cps", std::max(0.f, v));
                          sb::refreshCfg();
                      });
-            addInput({220.f, 80.f}, "Game TPS", std::to_string(c.tps), false,
+            addInput({220.f, 80.f}, "TPS", std::to_string(c.tps), false,
                      [](std::string const& s) {
                          int v;
                          if (!sb::parseInt(s, v)) return;
-                         Mod::get()->setSavedValue("cfg.tps", std::clamp(v, 30, 1000));
+                         Mod::get()->setSavedValue("cfg.tps", std::clamp(v, 30, 10000));
                          sb::refreshCfg();
                      });
         } else {
             addLabel("Orb assist: coming soon", {135.f, 84.f}, 0.5f, gold);
-            addLabel("Planned: keeps you on the orb path while you spam", {135.f, 58.f}, 0.34f,
-                     ccc3(180, 180, 180));
+                     ccc3(180, 180, 180);
         }
 
         // --- general
-        auto* hud = makePill("CPS WINDOW", menu_selector(SBConfigPopup::onToggle), c.hud, 104.f, 20.f);
-        hud->setTag(3);
+        auto* hud = makePill("HUD", menu_selector(SBConfigPopup::onToggle), c.hud, 104.f, 20.f);
+        hud->setTag(5);
         hud->setPosition({75.f, 24.f});
         menu->addChild(hud);
 
         auto* traj = makePill("TRAJECTORY", menu_selector(SBConfigPopup::onToggle), c.traj, 92.f, 20.f);
-        traj->setTag(4);
+        traj->setTag(6);
         traj->setPosition({189.f, 24.f});
         menu->addChild(traj);
     }
@@ -322,10 +355,11 @@ protected:
         const int tag = sender->getTag();
         switch (tag) {
             case 0: s_tab = 0; sb::setExclusiveMode("wave", !sb::Core::get().cfg.wave); break;
-            case 1: s_tab = 1; sb::setExclusiveMode("fp", !sb::Core::get().cfg.fp); break;
-            case 2: s_tab = 2; break;   // Orb assist: coming soon (just shows its tab)
-            case 3: mod->setSavedValue("cfg.hud-enabled", !sb::Core::get().cfg.hud); break;
-            case 4: mod->setSavedValue("cfg.traj-enabled", !sb::Core::get().cfg.traj); break;
+            case 1: s_tab = 1; sb::setExclusiveMode("ship", !sb::Core::get().cfg.ship); break;
+            case 2: s_tab = 2; sb::setExclusiveMode("fp", !sb::Core::get().cfg.fp); break;
+            case 3: s_tab = 3; break;   // Orb assist: coming soon (just shows its tab)
+            case 5: mod->setSavedValue("cfg.hud-enabled", !sb::Core::get().cfg.hud); break;
+            case 6: mod->setSavedValue("cfg.traj-enabled", !sb::Core::get().cfg.traj); break;
             default: return;
         }
         sb::refreshCfg();
@@ -489,8 +523,15 @@ class $modify(SBBase, GJBaseGameLayer) {
         // The wave buffer asks the ghost engine how long this event may be held
         // back; a held-back event is injected later by the lane.
         const bool forward = core.onReal(isPlayer1, down, g_engine.sbNext(), [&](bool d) {
-            return g_engine.sbWaveDelay(pl, isPlayer1, d, core.p1.gameDown,
-                                        core.p2.gameDown, core.lane(isPlayer1).gameDown);
+            int delay = 0;
+            auto& lane = core.lane(isPlayer1);
+            if (core.cfg.wave)
+                delay = g_engine.sbWaveDelay(pl, isPlayer1, d, core.p1.gameDown,
+                                             core.p2.gameDown, lane.gameDown);
+            if (!delay && core.cfg.ship)
+                delay = g_engine.sbShipDelay(pl, isPlayer1, d, core.p1.gameDown,
+                                             core.p2.gameDown, lane.gameDown, lane.halfPeriod());
+            return delay;
         });
         if (forward) {
             ++core.dbg.fwd;
@@ -512,6 +553,8 @@ class $modify(SBBase, GJBaseGameLayer) {
                 if (player && !player->m_isDead) {
                     view.valid = true;
                     view.isWave = player->m_isDart;
+                    view.isShip = player->m_isShip;
+                    view.buffered = (core.cfg.wave && view.isWave) || (core.cfg.ship && view.isShip);
                     view.upsideDown = player->m_isUpsideDown;
                     float x = player->getPositionX();
                     float dx = haveX[i] ? x - lastX[i] : 0.f;
@@ -550,6 +593,8 @@ class $modify(SBBase, GJBaseGameLayer) {
             if (!core.dual) {
                 views[1].valid = views[0].valid;
                 views[1].isWave = views[0].isWave;
+                views[1].isShip = views[0].isShip;
+                views[1].buffered = views[0].buffered;
                 views[1].upsideDown = views[0].upsideDown;
                 views[1].orbZone = views[0].orbZone;
             }
@@ -678,7 +723,7 @@ class $modify(SBPlay, PlayLayer) {
                                         core.dbg.in[0][0], core.dbg.in[0][1],
                                         core.dbg.in[1][0], core.dbg.in[1][1],
                                         core.dbg.fwd, core.dbg.inj);
-                if (core.cfg.traj && core.cfg.wave) text += "\n" + g_engine.sbStats();
+                if (core.cfg.traj && (core.cfg.wave || core.cfg.ship)) text += "\n" + g_engine.sbStats();
                 if (core.cfg.orb)
                     text += fmt::format("\norb zones {} / orbs {} | {}", core.zones.size(),
                                         core.orbs.size(), g_engine.sbLastText());
@@ -686,7 +731,7 @@ class $modify(SBPlay, PlayLayer) {
             }
         }
         if (auto* mark = m_fields->watermark)
-            mark->setVisible(core.cfg.wave || core.cfg.fp || core.cfg.orb);
+            mark->setVisible(core.cfg.wave || core.cfg.ship || core.cfg.fp || core.cfg.orb);
     }
 
     void resetLevel() {
