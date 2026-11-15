@@ -15,11 +15,14 @@ enum class Source : uint8_t { None, Wave, FramePerfect, Orb, Sync };
 enum class Mode : uint8_t { None, Wave, FramePerfect, Orb };
 
 struct Cfg {
-    bool wave = true, fp = false, orb = true, hud = true, traj = false;
+    bool wave = true, ship = false, fp = false, orb = true, hud = true, traj = false;
     // Wave spam = ghost-player buffer (Engine.hpp). Ranges are enforced in refreshCfg().
     int waveDelay = 6;                    // max ticks a press/release may be held back (0..8)
     int waveLook = 16;                    // ticks the ghost must survive (13..18)
     static constexpr int waveImminent = 8; // fixed
+    // Ship spam = the same ghost buffer, but it keeps the flight LINE (see Engine::sbShipDelay).
+    int shipDelay = 4;                    // max ticks a press/release may be held back (0..8)
+    int shipLook = 24;                    // ticks the ghost looks ahead (12..36)
     float fpCps = 30.f;
     float fpSlowerCps = 3.f; // minimum input is target CPS minus this absolute CPS allowance
     int tps = 240;
@@ -59,7 +62,8 @@ struct EventStream {
 };
 
 struct View {
-    bool valid = false, isWave = false, upsideDown = false;
+    bool valid = false, isWave = false, isShip = false, upsideDown = false;
+    bool buffered = false;    // wave / ship control is in charge of this player right now
     int orbZone = -1;         // index of the blue-orb zone the player is in / near (-1 = none)
 };
 
