@@ -32,24 +32,16 @@ using buf::g_engine;
 namespace sb {
 inline bool g_injecting = false;
 
-// Frame Perfect and the buffer modes (Wave, Ship) never run together: turning FP on
-// turns Wave / Ship off and the other way round. Wave and Ship can both be on: a
-// player is in only one gamemode at a time, so they never touch the same input.
+// Wave, Ship and Frame Perfect are mutually exclusive: turning one on turns the other
+// two off, so two assist engines can never fight over the same input.
 // "wave" / "ship" / "fp" selects the mode; on=false just switches it off.
 inline void setExclusiveMode(const char* mode, bool on) {
     auto* mod = Mod::get();
     auto& c = Core::get().cfg;
     const std::string m = mode;
-    if (m == "fp") {
-        c.fp = on;
-        if (on) c.wave = c.ship = false;
-    } else if (m == "wave") {
-        c.wave = on;
-        if (on) c.fp = false;
-    } else if (m == "ship") {
-        c.ship = on;
-        if (on) c.fp = false;
-    }
+    c.wave = on && m == "wave";
+    c.ship = on && m == "ship";
+    c.fp = on && m == "fp";
     c.orb = false;   // Orb assist: coming soon
     mod->setSavedValue("cfg.wave-enabled", c.wave);
     mod->setSavedValue("cfg.ship-enabled", c.ship);
@@ -85,15 +77,17 @@ static void refreshCfg() {
     c.fpSlowerCps = mod->getSavedValue<float>("cfg.fp-slower-cps", 3.f);
     c.orbLookahead = mod->getSavedValue<int>("cfg.orb-lookahead", 40);
 
-    c.tps = std::clamp(c.tps, 30, 1000);
+    c.tps = std::clamp(c.tps, 30, 10000);
     c.fpCps = std::clamp(c.fpCps, 1.f, float(c.tps) * 0.5f);
     c.fpSlowerCps = std::clamp(c.fpSlowerCps, 0.f, std::max(0.f, c.fpCps - 0.1f));
+    // never more than one mode (priority FP > Wave > Ship), whatever was saved
     if (c.fp) { c.wave = false; c.ship = false; }
+    else if (c.wave) { c.ship = false; }
     c.orb = false;
 
     c.waveDelay = std::clamp(c.waveDelay, 0, 8);
     c.waveLook = std::clamp(c.waveLook, 13, 18);
-    c.shipDelay = std::clamp(c.shipDelay, 0, 8);
+    c.shipDelay = std::clamp(c.shipDelay, 0, 12);
     c.shipLook = std::clamp(c.shipLook, 12, 36);
     c.orbLookahead = std::clamp(c.orbLookahead, 10, 120);
 
@@ -298,7 +292,7 @@ protected:
                      [](std::string const& s) {
                          int v;
                          if (!sb::parseInt(s, v)) return;
-                         Mod::get()->setSavedValue("cfg.ship-delay", std::clamp(v, 0, 8));
+                         Mod::get()->setSavedValue("cfg.ship-delay", std::clamp(v, 0, 12));
                          sb::refreshCfg();
                      });
             addInput({200.f, 80.f}, "Look (12-36)", std::to_string(c.shipLook), false,
@@ -335,7 +329,6 @@ protected:
                      });
         } else {
             addLabel("Orb assist: coming soon", {135.f, 84.f}, 0.5f, gold);
-                     ccc3(180, 180, 180);
         }
 
         // --- general
