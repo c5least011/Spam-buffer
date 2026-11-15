@@ -17,7 +17,6 @@ namespace sb {
 // injects them itself, one per step, so lastGameToggle / gameDown stay exact.
 struct InputLane {
     EventStream stream;
-    FramePerfect fp;
     OrbGuard orb;
 
     std::deque<Pend> pend;          // held-back wave events, in order
@@ -25,6 +24,9 @@ struct InputLane {
     uint64_t lastDelayStep = 0;     // last time a delay was applied (HUD)
     int lastDelay = 0;              // its length, in ticks (HUD)
     uint64_t delayed = 0;           // events delayed since the last reset (HUD)
+
+    uint64_t lastPress = 0;         // step of the last physical press on this side
+    bool everPressed = false;
 
     uint64_t lastGameToggle = 0;
     uint64_t lastAssistStep = 0;
@@ -37,8 +39,9 @@ struct InputLane {
 
     void reset(uint64_t now = 0) {
         stream.clear();
-        fp.reset();
         orb.reset();
+        lastPress = 0;
+        everPressed = false;
         pend.clear();
         lastArr = 0;
         lastDelayStep = 0;
@@ -61,9 +64,9 @@ struct InputLane {
     // `tick` = index of the next physics tick (the engine's clock): held-back events
     // are counted and fired in those ticks, not in input-queue steps.
     template <class Decide>
-    bool onReal(uint64_t step, uint64_t tick, bool down, const Cfg& cfg, Decide&& decide) {
-        bool forward = !fp.active && down != gameDown;
-        if (!fp.active && cfg.wave) {
+    bool onReal(uint64_t step, uint64_t tick, bool down, const Cfg& cfg, bool fpOwns, Decide&& decide) {
+        bool forward = !fpOwns && down != gameDown;
+        if (!fpOwns && (cfg.wave || cfg.ship)) {
             if (!pend.empty()) {
                 // an earlier event is still held back: stay behind it and keep
                 // the spacing the player had (no new search)
@@ -87,7 +90,10 @@ struct InputLane {
                     Origin::Player, forward);
         playerDown = down;
         modRun = 0;
-        fp.onReal(step);
+        if (down) {
+            lastPress = step;
+            everPressed = true;
+        }
         if (forward) {
             gameDown = down;
             lastGameToggle = step;
@@ -98,35 +104,52 @@ struct InputLane {
     // Held-back events are fired by main.cpp at the start of each physics tick
     // (fireDueWave). Here we only drop the queue when wave control is no longer in
     // charge (left wave / switched off): the game goes back to the finger's state.
-    Action flushPending(const View& view, bool waveOn) {
-        if (pend.empty() || (waveOn && view.valid && view.isWave)) return {};
+    Action flushPending(const View& view) {
+        if (pend.empty() || (view.valid && view.buffered)) return {};
         pend.clear();
         return gameDown != playerDown ? Action{true, playerDown, Source::Sync} : Action{};
     }
 
-    template <class Verdict>
-    Action onStep(uint64_t step, const View& view, const Cfg& cfg, Verdict&& verdict) {
+    // Keep the per-side bookkeeping current (every step, whoever owns the button).
+    void track(uint64_t step, const View& view) {
         if (view.valid) {
             upside = view.upsideDown;
             stream.trim(step, 4096);
         }
         mode = Mode::None;
+    }
 
-        Action action;
-        if (cfg.fp) action = fp.step(step, gameDown, playerDown, cfg);
-        else action = fp.off(gameDown, playerDown);
-
-        if (fp.active) {
-            pend.clear();                       // FP owns the lane
-            mode = Mode::FramePerfect;
-        } else {
-            if (!action.want) action = flushPending(view, cfg.wave);
-            if (!pend.empty() || (lastDelayStep && step - lastDelayStep < 30))
-                mode = Mode::Wave;
-            if (!action.want && pend.empty() && view.valid) {
-                action = orb.step(step, view, gameDown, playerDown, cfg.orb, spamming(step, cfg), verdict);
-                if (orb.engaged || orb.modHeld) mode = Mode::Orb;
+    // Half a click cycle of the player's spam, in steps (mean gap between the last
+    // physical toggles). The ship ghost assumes the spam goes on at this rhythm.
+    int halfPeriod() const {
+        uint64_t prev = 0, sum = 0;
+        int n = 0;
+        for (auto it = stream.ev.rbegin(); it != stream.ev.rend() && n < 6; ++it) {
+            if (it->origin != Origin::Player) continue;
+            if (prev && prev > it->step) {
+                sum += prev - it->step;
+                ++n;
             }
+            prev = it->step;
+        }
+        return n ? int(sum / uint64_t(n)) : 3;
+    }
+
+    // This side recently got physical input: it takes part in Frame Perfect.
+    bool participates(uint64_t step, const Cfg& cfg) const {
+        return everPressed && step - lastPress <= uint64_t(std::max(1, cfg.tps));
+    }
+
+    // Wave control / orb only (Frame Perfect is decided once for everybody in Core).
+    template <class Verdict>
+    Action onStep(uint64_t step, const View& view, const Cfg& cfg, Verdict&& verdict) {
+        Action action;
+        action = flushPending(view);
+        if (!pend.empty() || (lastDelayStep && step - lastDelayStep < 30))
+            mode = Mode::Wave;
+        if (!action.want && pend.empty() && view.valid) {
+            action = orb.step(step, view, gameDown, playerDown, cfg.orb, spamming(step, cfg), verdict);
+            if (orb.engaged || orb.modHeld) mode = Mode::Orb;
         }
         if (action.want && action.down == gameDown) action = {};
         return action;
@@ -186,6 +209,7 @@ struct Core {
     Cfg cfg;
     InputLane p1;
     InputLane p2;
+    FramePerfect fp;                // ONE Frame Perfect for everybody: CPS counted over all input
 
     std::vector<OrbPt> orbs;        // every blue orb of the level, sorted by x0
     std::vector<OrbZone> zones;     // groups of orbs, sorted by x0
@@ -210,6 +234,7 @@ struct Core {
     void reset() {
         p1.reset(step);
         p2.reset(step);
+        fp.reset();
         dbg = Dbg{};
     }
     void onPause() { reset(); }
@@ -217,7 +242,9 @@ struct Core {
     template <class Decide>
     bool onReal(bool isPlayer1, bool down, uint64_t tick, Decide&& decide) {
         if (!active) return true;
-        return lane(isPlayer1).onReal(step, tick, down, cfg, std::forward<Decide>(decide));
+        const bool fpOwns = fp.active;
+        fp.onReal(step);          // every press, any side, feeds the same CPS count
+        return lane(isPlayer1).onReal(step, tick, down, cfg, fpOwns, std::forward<Decide>(decide));
     }
 
     // Index of the blue-orb zone x is inside (or within `margin` of), else -1.
@@ -235,8 +262,38 @@ struct Core {
         ++step;
         std::array<Action, 2> actions{};
         if (!active) return actions;
-        actions[0] = p1.onStep(step, view1, cfg, [&] { return verdict(true); });
-        actions[1] = p2.onStep(step, view2, cfg, [&] { return verdict(false); });
+
+        InputLane* lanes[2] = {&p1, &p2};
+        const View* views[2] = {&view1, &view2};
+        for (int i = 0; i < 2; ++i) lanes[i]->track(step, *views[i]);
+
+        // Frame Perfect: no player-1 / player-2 distinction. All input is one count;
+        // once enough CPS is clicked it drives every side that is being pressed.
+        const bool wasActive = fp.active;
+        const bool anyPlayer = p1.playerDown || p2.playerDown;
+        const bool anyGame = p1.gameDown || p2.gameDown;
+        const Action fa = cfg.fp ? fp.step(step, anyGame, anyPlayer, cfg)
+                                 : fp.off(anyGame, anyPlayer);
+
+        bool part[2] = {p1.participates(step, cfg), p2.participates(step, cfg)};
+        if (!part[0] && !part[1]) part[0] = true;
+
+        for (int i = 0; i < 2; ++i) {
+            InputLane& lane = *lanes[i];
+            Action a;
+            if (fp.active) {
+                lane.pend.clear();
+                lane.mode = Mode::FramePerfect;
+                if (fa.want && part[i]) a = {true, fa.down, Source::FramePerfect};
+            } else if (wasActive) {
+                // FP just ended: every side goes back to its own finger
+                if (lane.gameDown != lane.playerDown) a = {true, lane.playerDown, Source::Sync};
+            } else {
+                a = lane.onStep(step, *views[i], cfg, [&, i] { return verdict(i == 0); });
+            }
+            if (a.want && a.down == lane.gameDown) a = {};
+            actions[i] = a;
+        }
         return actions;
     }
 
@@ -247,17 +304,17 @@ struct Core {
     std::string hud() const {
         auto laneText = [this](const InputLane& input) {
             char wave[40];
-            if (!cfg.wave) std::snprintf(wave, sizeof wave, "off");
+            if (!(cfg.wave || cfg.ship)) std::snprintf(wave, sizeof wave, "off");
             else if (!input.pend.empty()) std::snprintf(wave, sizeof wave, "HOLD %zu", input.pend.size());
             else if (input.delayed) std::snprintf(wave, sizeof wave, "on d%d x%llu", input.lastDelay,
                                                   (unsigned long long)input.delayed);
             else std::snprintf(wave, sizeof wave, "on");
             char b[224];
             std::snprintf(b, sizeof b,
-                "%s:%s  cps:%.1f  fp:%s %.1f/%.1f  wave:%s",
+                "%s:%s  cps:%.1f  fp:%s %.1f/%.1f  buf:%s",
                 input.modeName(), input.assists && step - input.lastAssistStep < 30 ? "ON" : "off",
-                input.inputCps(step, cfg), input.fp.active ? "ACTIVE" : (cfg.fp ? "armed" : "off"),
-                input.fp.targetCps(cfg), input.fp.minimumCps(cfg), wave);
+                input.inputCps(step, cfg), fp.active ? "ACTIVE" : (cfg.fp ? "armed" : "off"),
+                fp.targetCps(cfg), fp.minimumCps(cfg), wave);
             return std::string(b);
         };
 
