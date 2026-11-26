@@ -13,14 +13,8 @@ jobs:
       matrix:
         config:
           - name: Windows
-            os: windows-latest
-
-          - name: macOS
-            os: macos-latest
-
-          - name: iOS
-            os: macos-latest
-            target: iOS
+            os: windows-2022
+            target: Win64
 
           - name: Android32
             os: ubuntu-latest
@@ -30,7 +24,7 @@ jobs:
             os: ubuntu-latest
             target: Android64
 
-    name: Build ${{ matrix.config.name }}
+    name: Build 2.2091 / Geode v6 (${{ matrix.config.name }})
     runs-on: ${{ matrix.config.os }}
 
     steps:
@@ -43,14 +37,14 @@ jobs:
           target: ${{ matrix.config.target }}
           sdk: given
           cli: latest
-          # iOS dùng bindings fork của bạn, các nền tảng khác dùng bindings gốc
-          bindings: ${{ matrix.config.name == 'iOS' && 'c5least011/bindings' || 'geode-sdk/bindings' }}
-          bindings-ref: ${{ matrix.config.name == 'iOS' && 'fix/2.2081-depends' || '' }}
 
   package:
     name: Combine platform builds
     runs-on: ubuntu-latest
     needs: [build]
+    permissions:
+      contents: write
+      actions: write
 
     steps:
       - name: Combine Geode builds
@@ -60,5 +54,26 @@ jobs:
       - name: Upload combined mod
         uses: actions/upload-artifact@v4
         with:
-          name: Build Output
+          name: Build Output (GD 2.2091 - Geode v6.0.0)
           path: ${{ steps.build.outputs.build-output }}
+
+      - name: Publish latest release asset
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="latest-2.2091"
+          FILE=$(find "${{ steps.build.outputs.build-output }}" -name '*.geode' -type f | head -n 1)
+          if [ -z "$FILE" ]; then
+            echo "No combined .geode file found!" >&2
+            exit 1
+          fi
+          TITLE="Spam Buffer (GD 2.2091 / Geode v6.0.0)"
+          NOTES="Combined build (Windows + Android32 + Android64) for GD 2.2091 / Geode v6.0.0 from commit ${GITHUB_SHA}."
+          if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$FILE" --clobber -R "${{ github.repository }}"
+            gh release edit "$TAG" -R "${{ github.repository }}" --title "$TITLE" --notes "$NOTES"
+          else
+            gh release create "$TAG" "$FILE" -R "${{ github.repository }}" --target "${{ github.sha }}" --title "$TITLE" --notes "$NOTES"
+          fi

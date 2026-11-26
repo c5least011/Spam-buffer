@@ -442,10 +442,10 @@ class $modify(SBBase, GJBaseGameLayer) {
         return GJBaseGameLayer::canBeActivatedByPlayer(p0, p1);
     }
 
-    void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* vec, int objectsCount, float dt) {
+    void collisionCheckObjects(PlayerObject* player, std::vector<GameObject*>* vec, int objectsCount, float dt) {
         if (g_engine.isSimulating()) {
             g_engine.simTouchObjects(player, vec, objectsCount);   // gravity / speed portals, unknown objects
-            thread_local gd::vector<GameObject*> extra;
+            thread_local std::vector<GameObject*> extra;
             thread_local std::vector<std::pair<GameObject*, CCPoint>> moved;
             extra.clear();
             moved.clear();
@@ -642,8 +642,8 @@ class $modify(SBPlay, PlayLayer) {
         bool shiftWas = false;
     };
 
-    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+    bool init(GJGameLevel* level, bool dontCreateObjects) {
+        if (!PlayLayer::init(level, dontCreateObjects)) return false;
         g_engine.init();                       // hidden ghost players for the wave buffer
         return true;
     }
@@ -787,7 +787,7 @@ class $modify(SBEffectObject, EffectGameObject) {
         (void)self.setHookPriority("EffectGameObject::triggerObject", -1000000);
     }
 
-    void triggerObject(GJBaseGameLayer* p0, int p1, const gd::vector<int>* p2) {
+    void triggerObject(GJBaseGameLayer* p0, int p1, std::vector<int> const* p2) {
         if (g_engine.isSimulating()) {
             g_engine.simGravityPortal(this);
             return;

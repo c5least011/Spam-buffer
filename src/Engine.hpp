@@ -665,7 +665,7 @@ public:
     // The collision hook hands us the objects near a ghost player. Portals the
     // game would apply with side effects (or not at all) are applied here, by
     // geometry, with no visuals and without touching any real object state.
-    void simTouchObjects(PlayerObject* player, gd::vector<GameObject*>* vec, int count) {
+    void simTouchObjects(PlayerObject* player, std::vector<GameObject*>* vec, int count) {
         PlayLayer* pl = PlayLayer::get();
         if (!m_simulating || !pl || !isSimPlayer(player) || !vec) return;
         int who = player == m_stepObj[1] ? 1 : 0;
@@ -750,7 +750,7 @@ public:
     float moveFresh() const { return 40.f * std::max(1e-4f, stepDt()); }
 
     // real game, every collision pass of player 1
-    void observeObjects(gd::vector<GameObject*>* vec, int count) {
+    void observeObjects(std::vector<GameObject*>* vec, int count) {
         if (!cfg().moveDetect || !vec) return;
         if (m_moveTrk.size() > 4000) m_moveTrk.clear();
         double fresh = moveFresh();
