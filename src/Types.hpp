@@ -15,35 +15,38 @@ enum class Source : uint8_t { None, Wave, FramePerfect, Orb, Sync };
 enum class Mode : uint8_t { None, Wave, FramePerfect, Orb };
 
 struct Cfg {
-    bool wave = true, ship = false, fp = false, orb = true, hud = true, traj = false;
+    bool wave = true, ship = false, fp = false, orb = false, hud = true, traj = false;
     // Wave spam = ghost-player buffer (Engine.hpp). Ranges are enforced in refreshCfg().
     int waveDelay = 6;                    // max ticks a press/release may be held back (0..8)
     int waveLook = 16;                    // ticks the ghost must survive (13..18)
     static constexpr int waveImminent = 8; // fixed
-    // Ship spam = the same ghost buffer, but it keeps the flight LINE (see Engine::sbShipDelay).
-    int shipDelay = 4;                    // max ticks a press/release may be held back (0..8)
+    // Ship spam = ghost-player buffer that respects the player's actual spam rhythm and keeps the line.
+    int shipDelay = 4;                    // max ticks a press/release may be held back (0..12)
     int shipLook = 24;                    // ticks the ghost looks ahead (12..36)
     float fpCps = 30.f;
     float fpSlowerCps = 3.f; // minimum input is target CPS minus this absolute CPS allowance
     int tps = 240;
-    int orbLookahead = 40;                 // ticks the ghost looks ahead (10..120)
-    static constexpr int orbTap = 4;       // steps a rescue tap is held (matches the ghost)
-    static constexpr int orbCooldown = 6;  // steps between two rescues
-    static constexpr float orbPad = 60.f;  // how far the painted path extends around the orbs
-    static constexpr float orbSpamWindow = 0.8f;  // s: the orb assist runs only while you keep spamming
-    static constexpr float orbSpamIdle = 0.35f;   // s: no press for this long = spam stopped, assist off
+    // Orb spam = dual-layer assist: buffers mistimed early clicks (orbDelay) AND rescues missed clicks while spamming.
+    int orbDelay = 5;                      // max ticks an early click may be held back to hit an orb (0..10)
+    int orbLookahead = 36;                 // ticks the ghost looks ahead (15..80)
+    static constexpr int orbTap = 2;       // physics ticks a rescue tap is held (crisp for rapid orb chains)
+    static constexpr int orbCooldown = 3;  // physics ticks between two orb rescues
+    static constexpr float orbPad = 42.f;  // how far the painted path extends around the orbs
+    static constexpr float orbSpamWindow = 0.85f; // s: the orb rescue runs only while you keep spamming
+    static constexpr float orbSpamIdle = 0.40f;   // s: no press for this long = spam stopped, rescue off
 };
 
 struct InputEvent {
     uint64_t seq;
     uint64_t step;
+    uint64_t tick;
     double time;
     bool down;
     Origin origin;
     bool forwarded;
 };
 
-// A press / release held back by the wave buffer. Injected by the lane at step `at`.
+// A press / release held back by the wave / ship / orb buffer. Injected at physics tick `at`.
 struct Pend {
     uint64_t at;
     bool down;
@@ -52,8 +55,8 @@ struct Pend {
 struct EventStream {
     std::deque<InputEvent> ev;
     uint64_t nextSeq = 1;
-    void push(uint64_t step, double t, bool down, Origin o, bool fwd) {
-        ev.push_back({nextSeq++, step, t, down, o, fwd});
+    void push(uint64_t step, uint64_t tick, double t, bool down, Origin o, bool fwd) {
+        ev.push_back({nextSeq++, step, tick, t, down, o, fwd});
     }
     void trim(uint64_t now, uint64_t horizon) {
         while (!ev.empty() && ev.front().step + horizon < now) ev.pop_front();
@@ -63,13 +66,14 @@ struct EventStream {
 
 struct View {
     bool valid = false, isWave = false, isShip = false, upsideDown = false;
-    bool buffered = false;    // wave / ship control is in charge of this player right now
-    int orbZone = -1;         // index of the blue-orb zone the player is in / near (-1 = none)
+    bool buffered = false;    // wave / ship / orb buffer is in charge of this player right now
+    int orbZone = -1;         // index of the orb zone the player is in / near (-1 = none)
 };
 
-// One blue orb's hitbox (level units), and a group of them that sit close together.
+// One spam orb's hitbox (level units), and a group of them that sit close together.
 struct OrbPt {
     float x0, x1, y0, y1;
+    int id = 0;
 };
 struct OrbZone {
     float x0, x1;       // x range of the zone

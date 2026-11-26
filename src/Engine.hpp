@@ -66,7 +66,8 @@ private:
         int groundTicks = 0;
         bool unknown = false;          // touched something we cannot predict
         int ticks = 0;                 // ticks simulated in this slot
-        std::vector<int> touched;      // portals already applied (uniqueID*2 + player)
+        std::vector<int> touched;      // portals/pads already applied (uniqueID*2 + player)
+        std::vector<int> usedRings;    // orbs activated in THIS slot (uniqueID*2 + player)
     };
 
     enum class Layout { Solo, DualSolo, TwoPlayer };
@@ -113,6 +114,11 @@ private:
     PlayerObject* m_active = nullptr;
     PlayerObject* m_stepObj[2] = {nullptr, nullptr};
     bool m_stepEdge[2] = {false, false};   // this tick presses the button (false -> true)
+    struct OrbState {
+        bool done[2] = {false, false};     // an orb already reacted to this step's click
+        bool used = false;                 // the run being simulated activated an orb
+        bool allowBuffer = false;          // allow GD-style held-in-air orb buffering
+    } m_orb;
 
     // search bookkeeping
     int m_used = 0;
@@ -323,9 +329,9 @@ public:
         m_game[0] = game0;
         m_game[1] = game1;
         if (lay == Layout::Solo) m_game[0] = laneGame;
-        m_otherOverride = (lay == Layout::DualSolo) ? (push ? 1 : 0) : -1;
-        Decision d = decideHold(pl, M_WAVE, pi, push);
+        bool dualMirror = (lay == Layout::DualSolo && pl->m_player1 && pl->m_player2);
         m_otherOverride = -1;
+        Decision d = decideHold(pl, M_WAVE, pi, push, dualMirror);
         if (!d.known || d.drop || d.delay <= 0) return 0;
         ++m_dbgDelayed;
         return d.delay;
@@ -333,18 +339,15 @@ public:
 
 
     // ------------------------------------------------------------- ship spam
-    // Ship spam is a straight line (flat, up or down). The wave buffer asks "which
-    // delay SURVIVES"; for a ship that is the wrong question: a gap, a notch or a spike
-    // box can make a sloppy path look safe and drag the ship off its line. So here:
-    //   * the line is the ship's own recent average motion (through where it is now);
-    //   * every delay is simulated with the player's spam rhythm going on (not a long
-    //     constant hold), and scored by how far it strays from that line;
-    //   * a delay is used only if the ship is in danger (dies soon) and a delay that
-    //     survives AND stays close to the line exists. Otherwise the input passes
-    //     untouched: it never chases a gap away from the line.
-    // `half` = half a click cycle of the player's spam, in ticks.
-    // Returns the number of ticks to hold the press / release back (0 = pass).
-    int sbShipDelay(PlayLayer* pl, bool isP1, bool push, bool game0, bool game1, bool laneGame, int half) {
+    // Ship spam keeps a smooth line without fighting the player's rhythm:
+    //   * Uses the player's actual measured hold/release durations in PHYSICS TICKS (not render FPS);
+    //   * Never delays an already-safe input (zero sluggishness during normal spam);
+    //   * When acting NOW would crash, searches 1..maxDelay for a delay that either:
+    //       Tier 1: survives the full look-ahead H (preferring straightest path + 1-tick safe margin);
+    //       Tier 2: pushes death clearly further back (reach >= now + 3) while staying near the line;
+    //       Tier 3: constant-hold rescue fallback for long holds/releases approaching spikes.
+    int sbShipDelay(PlayLayer* pl, bool isP1, bool push, bool game0, bool game1, bool laneGame,
+                    int holdDur, int relDur) {
         auto& c = cfg();
         if (!pl || !m_ready || !c.enabled) return 0;
         int frames = static_cast<int>(CCDirector::sharedDirector()->getTotalFrames());
@@ -364,30 +367,37 @@ public:
         m_game[0] = game0;
         m_game[1] = game1;
         if (lay == Layout::Solo) m_game[0] = laneGame;
-        m_otherOverride = (lay == Layout::DualSolo) ? (push ? 1 : 0) : -1;
+        bool dualMirror = (lay == Layout::DualSolo && pl->m_player1 && pl->m_player2);
+        m_otherOverride = -1;
 
         const int H = std::max(12, c.shipHorizon);
-        half = clampi(half, 2, 12);
-        const int imminent = c.shipImminent;
+        holdDur = clampi(holdDur, 2, 14);
+        relDur = clampi(relDur, 2, 14);
+        const int imminent = std::max(8, c.shipImminent);
 
-        // the straight line: through the ship now, with its recent mean slope
+        // Straight-line reference: clamped recent average slope so a prior turn doesn't point into a spike
         float slope = 0.f;
         auto& hist = m_yHist[pi];
-        if (hist.size() >= 10) {
-            int n = std::min<int>(int(hist.size()) - 1, 32);
-            slope = (hist.back() - hist[hist.size() - 1 - n]) / float(n);
+        if (hist.size() >= 8) {
+            int n = std::min<int>(int(hist.size()) - 1, 20);
+            slope = std::clamp((hist.back() - hist[hist.size() - 1 - n]) / float(n), -1.6f, 1.6f);
         }
         const float y0 = po->getPositionY();
 
-        constexpr float kOkDev = 18.f;      // mean distance from the line that still counts as straight
-        constexpr float kMaxDev = 60.f;     // a delay that strays further than this is never taken
-        constexpr float kBetter = 8.f;      // and it must be at least this much straighter
+        constexpr float kMaxDev = 75.f;
 
-        struct Cand { bool alive = false; float dev = 0.f; int reach = 0; };
+        struct Cand {
+            bool alive = false;
+            bool endedUnk = false;
+            float dev = 0.f;
+            int reach = 0;
+            std::vector<TrailPt> trail;
+        };
         std::vector<Cand> cand;
         cand.reserve(maxDelay + 1);
 
-        beginSearch(pl, pi);
+        beginSearch(pl, pi, true, dualMirror);
+        orbBegin(push);
         loadReal(0);
         float waitSum = 0.f;
         int waitN = 0;
@@ -397,37 +407,48 @@ public:
                     noteDeath(0);
                     break;
                 }
+                trailPush(0, 0);
                 if (m_info[0].unknown) break;
                 float y = m_p[m_tp][0]->getPositionY();
                 waitSum += std::fabs(y - (y0 + slope * float(d)));
                 ++waitN;
             }
             copySlot(1, 0);
+            size_t mark = m_trail.size();
+            orbBegin(push);
             Cand cd;
             cd.alive = true;
-            cd.reach = d;
+            cd.reach = 0;
             float sum = waitSum;
             int n = waitN;
             bool hold = push;
+            int segTarget = hold ? holdDur : relDur;
             int since = 0;
-            for (int t = d; t < H; ++t) {
+            for (int t = 0; t < H; ++t) {
                 if (!step(1, hold)) {
                     noteDeath(1);
                     cd.alive = false;
                     break;
                 }
-                if (m_info[1].unknown) break;
+                trailPush(1, 0);
+                if (m_info[1].unknown) {
+                    cd.endedUnk = true;
+                    break;
+                }
                 float y = m_p[m_tp][1]->getPositionY();
-                sum += std::fabs(y - (y0 + slope * float(t + 1)));
+                sum += std::fabs(y - (y0 + slope * float(d + t + 1)));
                 ++n;
                 ++cd.reach;
-                if (++since >= half) {                        // the spam goes on at its own rhythm
+                if (++since >= segTarget) {                   // continue player's asymmetric spam rhythm
                     hold = !hold;
+                    segTarget = hold ? holdDur : relDur;
                     since = 0;
                 }
             }
             cd.dev = n > 0 ? sum / float(n) : 0.f;
-            cand.push_back(cd);
+            if (m_wantTrail && cd.alive) cd.trail = m_trail;
+            cand.push_back(std::move(cd));
+            m_trail.resize(mark);
             if (m_aborted) break;
         }
 
@@ -435,32 +456,74 @@ public:
         const char* why = "pass";
         if (!m_aborted && !cand.empty()) {
             const Cand& now = cand[0];
-            if (now.alive && now.dev <= kOkDev) {
-                why = "straight";                             // on the line and safe: leave it alone
-            } else if (!now.alive && now.reach < 2) {
-                why = "out-of-sync";                          // dies at once: the ghost cannot be trusted
-            } else if (!now.alive && now.reach >= imminent) {
-                why = "not-imminent";
+            if (now.alive) {
+                // Safe right now: NEVER delay an input that already survives cleanly!
+                why = "SAFE";
+                if (m_wantTrail) m_trailOk = now.trail;
+            } else if (now.reach < 2) {
+                why = "out-of-sync";
             } else {
-                int best = -1;
+                // Tier 1: find delays that survive the full look-ahead H and stay close to the line
+                int bestFull = -1;
                 for (int d = 1; d < int(cand.size()); ++d) {
-                    if (!cand[d].alive || cand[d].dev > kMaxDev) continue;
-                    if (best < 0 || cand[d].dev < cand[best].dev - 1.f) best = d;
+                    if (!cand[d].alive || cand[d].endedUnk || cand[d].dev > kMaxDev) continue;
+                    if (bestFull < 0 || cand[d].dev < cand[bestFull].dev - 2.f) bestFull = d;
                 }
-                if (best > 0 && (!now.alive || now.dev - cand[best].dev >= kBetter)) {
-                    delay = best;
+                if (bestFull > 0) {
+                    // Push +1 tick into safe interior if the next tick also survives cleanly
+                    if (bestFull + 1 < int(cand.size()) && cand[bestFull + 1].alive &&
+                        !cand[bestFull + 1].endedUnk && cand[bestFull + 1].dev <= cand[bestFull].dev + 4.f) {
+                        delay = bestFull + 1;
+                    } else {
+                        delay = bestFull;
+                    }
                     why = "DELAY";
+                    if (m_wantTrail) m_trailOk = cand[delay].trail;
                 } else {
-                    why = "no-straight-way";                  // nothing keeps the line: do not chase a gap
+                    // Tier 2: tight corridor where rigid alternation dies later — pick clearly safer delay
+                    int bestExt = -1;
+                    for (int d = 1; d < int(cand.size()); ++d) {
+                        if (cand[d].dev > kMaxDev) continue;
+                        if (cand[d].reach < now.reach + 3) continue;
+                        if (bestExt < 0 || cand[d].reach > cand[bestExt].reach ||
+                            (cand[d].reach == cand[bestExt].reach && cand[d].dev < cand[bestExt].dev)) {
+                            bestExt = d;
+                        }
+                    }
+                    if (bestExt > 0) {
+                        delay = bestExt;
+                        why = "EXTEND";
+                    } else if (now.reach < imminent) {
+                        // Tier 3: non-spam constant-hold rescue (e.g. diving or climbing into a spike)
+                        int dirH = std::min(H, 16);
+                        loadReal(0);
+                        for (int d = 1; d <= maxDelay; ++d) {
+                            if (!step(0, m_game[pi]) || m_info[0].unknown) break;
+                            copySlot(1, 0);
+                            bool ok = true;
+                            for (int t = 0; t < dirH; ++t) {
+                                if (!step(1, push)) { ok = false; break; }
+                                if (m_info[1].unknown) break;
+                            }
+                            if (ok && !m_aborted) {
+                                delay = d;
+                                why = "HOLD-SAVE";
+                                break;
+                            }
+                            if (m_aborted) break;
+                        }
+                    } else {
+                        why = "no-better";
+                    }
                 }
             }
         }
         ++m_dbgSearches;
-        m_lastText = fmt::format("P{} ship {} d={} {} dev0={:.0f} slope={:.2f} half={}{}", pi + 1,
-                                 push ? "hold" : "release", delay, why,
-                                 cand.empty() ? 0.f : cand[0].dev, slope, half, m_aborted ? " ABORT" : "");
+        m_lastText = fmt::format("P{} ship {} d={} {} r0={} hd={}/{} sl={:.2f}{}", pi + 1,
+                                 push ? "hold" : "rel", delay, why,
+                                 cand.empty() ? 0 : cand[0].reach, holdDur, relDur, slope,
+                                 m_aborted ? " ABORT" : "");
         endSearch();
-        m_otherOverride = -1;
         if (delay > 0) ++m_dbgDelayed;
         return delay;
     }
@@ -511,6 +574,7 @@ public:
     // fired at the start of a tick, exactly like the input buffer mod did.
     uint64_t sbNow() const { return uint64_t(m_now); }
     uint64_t sbNext() const { return uint64_t(m_now) + 1; }
+    float sbTps() const { return effectiveTps(); }
 
     std::string sbStats() const {
         return fmt::format("buf {} searches {} delayed {} | {}", m_ready ? "ready" : "NOT-READY",
@@ -543,16 +607,297 @@ public:
         }
     }
 
-    // ------------------------------------------------------------ orb rescue
-    // Blue (gravity) orbs only, and only while the player keeps spamming.
-    // The orbs of the zone are painted into a path (see inPath). Each step the
-    // ghost checks:
-    //   * would a click right now activate a blue orb? (otherwise nothing to do)
-    //   * with no click, does the player stay on the path for the whole look-ahead?
-    //     If yes: leave it alone.
-    //   * if it would fall off the path or die, would a tap now keep it on the
-    //     path clearly longer (and alive)? Then inject that tap.
-    // Returns true = inject a tap now.
+    // ------------------------------------------------------------ orb spam (buffer + rescue)
+    static bool isSpamOrbId(int id) {
+        return id == 36 || id == 84 || id == 141 || id == 1022 ||
+               id == 1330 || id == 1333 || id == 3004;
+    }
+
+    static bool isSimOrb(GameObject* obj) {
+        if (!obj) return false;
+        switch (obj->m_objectType) {
+            case GameObjectType::YellowJumpRing:
+            case GameObjectType::PinkJumpRing:
+            case GameObjectType::GravityRing:
+            case GameObjectType::GreenRing:
+            case GameObjectType::DropRing:
+            case GameObjectType::RedJumpRing:
+            case GameObjectType::SpiderOrb:
+            case GameObjectType::DashRing:
+            case GameObjectType::GravityDashRing:
+                return geode::cast::typeinfo_cast<RingObject*>(obj) != nullptr;
+            default:
+                return false;
+        }
+    }
+
+    static bool isRelevantSimObject(GameObject* obj) {
+        if (!obj) return false;
+        switch (obj->m_objectType) {
+            case GameObjectType::Solid:
+            case GameObjectType::Hazard:
+            case GameObjectType::AnimatedHazard:
+            case GameObjectType::CollisionObject:
+            case GameObjectType::Slope:
+            case GameObjectType::InverseGravityPortal:
+            case GameObjectType::NormalGravityPortal:
+            case GameObjectType::GravityTogglePortal:
+            case GameObjectType::YellowJumpPad:
+            case GameObjectType::PinkJumpPad:
+            case GameObjectType::GravityPad:
+            case GameObjectType::RedJumpPad:
+            case GameObjectType::SpiderPad:
+            case GameObjectType::YellowJumpRing:
+            case GameObjectType::PinkJumpRing:
+            case GameObjectType::GravityRing:
+            case GameObjectType::GreenRing:
+            case GameObjectType::DropRing:
+            case GameObjectType::RedJumpRing:
+            case GameObjectType::SpiderOrb:
+            case GameObjectType::DashRing:
+            case GameObjectType::GravityDashRing:
+            case GameObjectType::CustomRing:
+            case GameObjectType::TeleportOrb:
+            case GameObjectType::ShipPortal:
+            case GameObjectType::CubePortal:
+            case GameObjectType::BallPortal:
+            case GameObjectType::UfoPortal:
+            case GameObjectType::WavePortal:
+            case GameObjectType::RobotPortal:
+            case GameObjectType::SpiderPortal:
+            case GameObjectType::SwingPortal:
+            case GameObjectType::RegularSizePortal:
+            case GameObjectType::MiniSizePortal:
+            case GameObjectType::InverseMirrorPortal:
+            case GameObjectType::NormalMirrorPortal:
+            case GameObjectType::DualPortal:
+            case GameObjectType::SoloPortal:
+            case GameObjectType::TeleportPortal:
+                return true;
+            case GameObjectType::Modifier: {
+                int id = obj->m_objectID;
+                return id == 200 || id == 201 || id == 202 || id == 203 || id == 1334;
+            }
+            default:
+                return false;
+        }
+    }
+
+    void orbBegin(bool allowBuffer = false) {
+        m_orb.used = false;
+        m_orb.allowBuffer = allowBuffer;
+    }
+    bool orbUsed() const { return m_orb.used; }
+
+    bool isRingConsumed(int slot, int who, RingObject* ring) const {
+        if (!ring || ring->m_isDisabled || ring->m_isDisabled2 ||
+            ring->m_isGroupDisabled || ring->m_isSpawnOnly) {
+            return true;
+        }
+        if (ring->m_isMultiActivate) return false;
+        if (who == 0 ? ring->m_activatedByPlayer1 : ring->m_activatedByPlayer2) return true;
+        int key = ring->m_uniqueID * 2 + who;
+        auto const& used = m_info[slot].usedRings;
+        return std::find(used.begin(), used.end(), key) != used.end();
+    }
+
+    bool canFireOrbNow(PlayerObject* player, int who) const {
+        if (!cfg().orbDetect || m_orb.done[who] || !player) return false;
+        if (m_stepEdge[who]) return true;
+        return m_orb.allowBuffer && player->m_stateRingJump;
+    }
+
+    void orbNoteHit(int who, RingObject* ring) {
+        ++m_dbgRingHit;
+        if (ring && ring->m_objectID == 84) {
+            ++m_dbgBlueHit;
+            m_blueX = ring->getPositionX();
+        }
+        m_orb.done[who] = true;
+        m_orb.used = true;
+    }
+
+    bool canSimRingTouch(PlayerObject* player, EffectGameObject* object) {
+        if (!m_simulating || !isSimPlayer(player) || !object) return false;
+        if (!isSimOrb(object)) return false;
+        auto ring = static_cast<RingObject*>(object);
+        int who = player == m_stepObj[1] ? 1 : 0;
+        return !isRingConsumed(m_curSlot, who, ring);
+    }
+
+    void simTouchedRing(PlayerObject* player, RingObject* ring) {
+        if (!m_simulating || !isSimPlayer(player) || !ring) return;
+        if (!isSimOrb(ring)) return;
+        int who = player == m_stepObj[1] ? 1 : 0;
+        if (isRingConsumed(m_curSlot, who, ring)) return;
+        ++m_dbgRingSeen;
+        if (player->m_touchingRings && !player->m_touchingRings->containsObject(ring)) {
+            player->m_touchingRings->addObject(ring);
+        }
+        if (canFireOrbNow(player, who)) {
+            bool prevState = player->m_stateRingJump;
+            if (m_stepEdge[who]) player->m_stateRingJump = true;
+            player->ringJump(ring, true);
+            if (!m_orb.done[who]) player->m_stateRingJump = prevState;
+        }
+    }
+
+    bool beforeSimRingJump(PlayerObject* player, RingObject* ring) {
+        if (!isSimOrb(ring)) return false;
+        int who = player == m_stepObj[1] ? 1 : 0;
+        if (!canFireOrbNow(player, who)) return false;
+        if (isRingConsumed(m_curSlot, who, ring)) return false;
+        return true;
+    }
+
+    void afterSimRingJump(PlayerObject* player, RingObject* ring, bool changed) {
+        if (!changed || !player || !ring) return;
+        int who = player == m_stepObj[1] ? 1 : 0;
+        orbNoteHit(who, ring);
+        if (!ring->m_isMultiActivate) {
+            int key = ring->m_uniqueID * 2 + who;
+            auto& used = m_info[m_curSlot].usedRings;
+            if (std::find(used.begin(), used.end(), key) == used.end()) used.push_back(key);
+        }
+    }
+
+    // Layer 1 (Orb Spam Buffer): when the player clicks early near/inside an orb,
+    // delay the press by 1..maxDelay ticks so it lands on the safe orb activation window!
+    int sbOrbDelay(PlayLayer* pl, bool isP1, bool game0, bool game1, bool laneGame,
+                   int maxDelay, int look) {
+        auto& c = cfg();
+        if (!pl || !m_ready || !c.enabled || !c.orbDetect || maxDelay <= 0) return 0;
+        int frames = static_cast<int>(CCDirector::sharedDirector()->getTotalFrames());
+        if (frames - m_lastTickFrame > c.failOpen) return 0;
+        if (m_load > 4.f) return 0;
+        Layout lay = layoutOf(pl);
+        m_layout = lay;
+        if (lay == Layout::TwoPlayer && !c.twoPlayerMode) return 0;
+        if (lay == Layout::DualSolo && !c.dualSupport) return 0;
+        int pi = (lay != Layout::Solo && !isP1) ? 1 : 0;
+        PlayerObject* po = pi == 0 ? pl->m_player1 : pl->m_player2;
+        if (!po || po->m_isDead) return 0;
+        Mode mode = detectMode(po);
+        if (mode == M_WAVE || mode == M_SHIP) return 0;
+
+        m_game[0] = game0;
+        m_game[1] = game1;
+        if (lay == Layout::Solo) m_game[0] = laneGame;
+        bool dualMirror = (lay == Layout::DualSolo && pl->m_player1 && pl->m_player2);
+        m_otherOverride = -1;
+
+        const int H = std::clamp(look, 12, 80);
+        const int tap = std::max(1, sb::Cfg::orbTap);
+
+        beginSearch(pl, pi, true, dualMirror);
+        loadReal(0);
+
+        struct OrbCand {
+            bool alive = false;
+            bool hitOrb = false;
+            int reach = 0;
+            std::vector<TrailPt> trail;
+        };
+        std::vector<OrbCand> cand;
+        cand.reserve(maxDelay + 1);
+
+        for (int d = 0; d <= maxDelay; ++d) {
+            if (d > 0) {
+                orbBegin(false);
+                if (!step(0, false)) {
+                    noteDeath(0);
+                    break;
+                }
+                trailPush(0, 0);
+                if (m_info[0].unknown) break;
+            }
+            copySlot(1, 0);
+            size_t mark = m_trail.size();
+            orbBegin(false);
+            OrbCand oc;
+            oc.alive = true;
+            // Probe tick 0 of the click: must hit an orb at delay d (or if d == 0, check survival)
+            for (int t = 0; t < H; ++t) {
+                bool h = t < tap;
+                if (!step(1, h)) {
+                    noteDeath(1);
+                    oc.alive = false;
+                    break;
+                }
+                if (t == 0 && orbUsed()) oc.hitOrb = true;
+                trailPush(1, t == 0 && oc.hitOrb ? 2 : 0);
+                if (m_info[1].unknown) break;
+                ++oc.reach;
+                // Early exit on d > 0 if clicking at tick d didn't even touch an orb on tick 0
+                if (d > 0 && t == 0 && !oc.hitOrb) {
+                    oc.alive = false;
+                    break;
+                }
+            }
+            if (m_wantTrail && oc.alive && oc.hitOrb) oc.trail = m_trail;
+            cand.push_back(std::move(oc));
+            m_trail.resize(mark);
+            if (m_aborted) break;
+        }
+
+        int delay = 0;
+        const char* why = "pass";
+        if (!m_aborted && !cand.empty()) {
+            const OrbCand& now = cand[0];
+            if (now.hitOrb && now.alive) {
+                why = "ORB-OK";
+                if (m_wantTrail) m_trailOk = now.trail;
+            } else {
+                // Prefer earliest delay d >= 1 that hits an orb AND survives full H
+                int firstSafe = -1;
+                for (int d = 1; d < int(cand.size()); ++d) {
+                    if (cand[d].hitOrb && cand[d].alive) {
+                        firstSafe = d;
+                        break;
+                    }
+                }
+                if (firstSafe > 0) {
+                    // Push +1 tick into safe interior if the next tick also hits an orb & survives
+                    if (firstSafe + 1 < int(cand.size()) && cand[firstSafe + 1].hitOrb && cand[firstSafe + 1].alive) {
+                        delay = firstSafe + 1;
+                    } else {
+                        delay = firstSafe;
+                    }
+                    why = "ORB-DELAY";
+                    if (m_wantTrail) m_trailOk = cand[delay].trail;
+                } else {
+                    // Even if full H dies (e.g. needs another orb click later), pick the orb-hit delay
+                    // that clearly survives longer than clicking now!
+                    int bestExt = -1;
+                    int baseR = now.hitOrb ? now.reach : 0;
+                    for (int d = 1; d < int(cand.size()); ++d) {
+                        if (!cand[d].hitOrb) continue;
+                        if (cand[d].reach < baseR + 4) continue;
+                        if (bestExt < 0 || cand[d].reach > cand[bestExt].reach) bestExt = d;
+                    }
+                    if (bestExt > 0) {
+                        delay = bestExt;
+                        why = "ORB-EXT";
+                    }
+                }
+            }
+        }
+
+        ++m_dbgSearches;
+        m_lastText = fmt::format("P{} orb-buf d={} {}{}", pi + 1, delay, why, m_aborted ? " ABORT" : "");
+        endSearch();
+        if (delay > 0) {
+            ++m_dbgDelayed;
+            ++m_dbgOrbDelays;
+        }
+        return delay;
+    }
+
+    // Layer 2 (Orb Spam Rescue): works on ALL gameplay spam orbs while the player is actively spamming
+    // and their finger is currently UP. Checks:
+    //   1) Would clicking NOW activate ANY unconsumed gameplay orb? (cheap 1-tick gate)
+    //   2) With no click, does the player die or leave the painted orb chain?
+    //   3) Does tapping NOW hit the orb and stay alive/on-path clearly longer?
     bool sbOrbRescue(PlayLayer* pl, bool isP1, bool game0, bool game1, bool laneGame,
                      int look, const sb::OrbPt* orbs, int orbCount) {
         auto& c = cfg();
@@ -568,37 +913,39 @@ public:
         PlayerObject* po = pi == 0 ? pl->m_player1 : pl->m_player2;
         if (!po || po->m_isDead) return false;
         Mode mode = detectMode(po);
-        if (mode == M_WAVE || mode == M_SHIP || mode == M_SWING) return false;
+        if (mode == M_WAVE || mode == M_SHIP) return false;
 
         m_game[0] = game0;
         m_game[1] = game1;
         if (lay == Layout::Solo) m_game[0] = laneGame;
+        bool dualMirror = (lay == Layout::DualSolo && pl->m_player1 && pl->m_player2);
         m_otherOverride = -1;
-        const int H = std::max(10, look);
-        const int tap = std::max(1, c.tapTicks);
+        const int H = std::clamp(look, 12, 80);
+        const int tap = std::max(1, sb::Cfg::orbTap);
         const float pad = sb::Cfg::orbPad;
 
-        beginSearch(pl, pi, false);
+        beginSearch(pl, pi, false, dualMirror);
         bool rescue = false;
         const char* why = "no-orb";
 
-        // 1) cheap gate: would a click this very tick activate a blue orb?
+        // 1) cheap 1-tick gate: would a click this very tick activate ANY unconsumed gameplay orb?
         loadReal(1);
         m_info[1].groundTicks = 0;
-        long blueBefore = m_dbgBlueHit;
+        orbBegin(false);
         bool alive = step(1, true);
-        if (alive && m_dbgBlueHit != blueBefore && !m_aborted) {
-            // 2) no click: does it stay on the painted path?
+        if (alive && orbUsed() && !m_aborted) {
+            // 2) no click: does it stay alive and on the painted orb path?
             OrbRun idle = orbRun(0, -1, tap, H, orbs, orbCount, pad);
             if (idle.end == 3) {
                 why = "unknown";
             } else if (idle.end == 0) {
                 why = "on-path";
             } else {
-                // 3) falling off / dying: does a tap now keep it on the path clearly longer?
+                // 3) dying or leaving the orb chain: does a tap now keep it alive/on-path clearly longer?
                 OrbRun tapNow = orbRun(1, 0, tap, H, orbs, orbCount, pad);
-                const bool better = tapNow.blue && tapNow.end != 2 && tapNow.end != 3 &&
-                                    (tapNow.end == 0 || tapNow.ticks >= idle.ticks + 4);
+                const bool better = tapNow.hitOrb && tapNow.end != 2 && tapNow.end != 3 &&
+                                    (tapNow.end == 0 || tapNow.ticks >= idle.ticks + 4 ||
+                                     (idle.end == 2 && tapNow.ticks >= idle.ticks + 2));
                 rescue = better && !m_aborted;
                 why = rescue ? "RESCUE" : (m_aborted ? "abort" : "tap-no-better");
             }
@@ -677,6 +1024,14 @@ public:
             if (kind == TouchKind::None) continue;
             CCRect orect = obj->getObjectRect();
             if (!orect.intersectsRect(pr)) continue;
+            EffectGameObject* eff = geode::cast::typeinfo_cast<EffectGameObject*>(obj);
+            if (eff) {
+                if ((kind == TouchKind::Gravity || kind == TouchKind::Speed || kind == TouchKind::Pad) &&
+                    !eff->m_isMultiActivate &&
+                    (who == 0 ? eff->m_activatedByPlayer1 : eff->m_activatedByPlayer2)) {
+                    continue;
+                }
+            }
             if (markTouched(obj, who)) continue;
             if (kind == TouchKind::Gravity) {
                 ++m_evGrav;
@@ -684,6 +1039,13 @@ public:
             } else if (kind == TouchKind::Speed) {
                 ++m_evSpeed;
                 player->updateTimeMod(speedOf(obj->m_objectID), true);
+            } else if (kind == TouchKind::Pad) {
+                applyPad(pl, player, obj, eff);
+            } else if (kind == TouchKind::Size) {
+                player->togglePlayerScale(obj->m_objectType == GameObjectType::MiniSizePortal, true);
+                player->setVisible(false);
+                player->m_isObjectRectDirty = true;
+                player->m_isOrientedBoxDirty = true;
             } else {
                 ++m_evUnknown;
                 m_hitUnknown = true;
@@ -757,6 +1119,7 @@ public:
         for (int i = 0; i < count; ++i) {
             GameObject* o = vec->at(i);
             if (!o || !o->m_groups || o->m_groups->at(0) == 0) continue;     // not movable
+            if (!isRelevantSimObject(o)) continue;
             auto& t = m_moveTrk[o->m_uniqueID];
             CCPoint p = o->getPosition();
             if (!t.seen) {
@@ -1061,7 +1424,7 @@ private:
         }
     }
 
-    enum class TouchKind { None, Gravity, Speed, Unknown };
+    enum class TouchKind { None, Gravity, Speed, Pad, Size, Unknown };
 
     static float speedOf(int id) {
         switch (id) {
@@ -1087,12 +1450,17 @@ private:
                 }
                 return TouchKind::None;
             }
-            // not predicted: the prediction stops here
             case GameObjectType::YellowJumpPad:
             case GameObjectType::PinkJumpPad:
             case GameObjectType::GravityPad:
             case GameObjectType::RedJumpPad:
             case GameObjectType::SpiderPad:
+                return TouchKind::Pad;
+            case GameObjectType::RegularSizePortal:
+            case GameObjectType::MiniSizePortal:
+                return TouchKind::Size;
+            // not predicted: the prediction stops here
+            case GameObjectType::CustomRing:
             case GameObjectType::TeleportOrb:
             case GameObjectType::ShipPortal:
             case GameObjectType::CubePortal:
@@ -1102,8 +1470,6 @@ private:
             case GameObjectType::RobotPortal:
             case GameObjectType::SpiderPortal:
             case GameObjectType::SwingPortal:
-            case GameObjectType::RegularSizePortal:
-            case GameObjectType::MiniSizePortal:
             case GameObjectType::InverseMirrorPortal:
             case GameObjectType::NormalMirrorPortal:
             case GameObjectType::DualPortal:
@@ -1133,6 +1499,27 @@ private:
             default: return;
         }
         pl->flipGravity(player, upsideDown, true);
+    }
+
+    void applyPad(PlayLayer* pl, PlayerObject* player, GameObject* obj, EffectGameObject* eff) {
+        if (!pl || !player || !obj) return;
+        if (obj->m_objectType == GameObjectType::GravityPad) {
+            pl->flipGravity(player, !player->m_isUpsideDown, true);
+            player->propellPlayer(0.8f, true, 67);
+            player->m_touchedPad = true;
+            return;
+        }
+        if (!eff) return;
+        const bool a0 = eff->m_activated;
+        const bool a1 = eff->m_activatedByPlayer1;
+        const bool a2 = eff->m_activatedByPlayer2;
+        const bool a3 = eff->m_isActivated;
+        pl->bumpPlayer(player, eff);
+        eff->m_activated = a0;
+        eff->m_activatedByPlayer1 = a1;
+        eff->m_activatedByPlayer2 = a2;
+        eff->m_isActivated = a3;
+        player->setVisible(false);
     }
 
     // One line per rescued event: what the game was running at, how much the event was
@@ -1183,24 +1570,169 @@ private:
         self->m_collisionLogRight->removeAllObjects();
     }
 
+    static bool isHoldingJump(PlayerObject* p) {
+        if (!p) return false;
+        auto it = p->m_holdingButtons.find(static_cast<int>(PlayerButton::Jump));
+        return it != p->m_holdingButtons.end() && it->second;
+    }
+
+    static void simUpdateJumpVars(PlayerObject* p) {
+        if (!p) return;
+        p->m_stateJumpBuffered = p->m_jumpBuffered;
+        p->m_stateRingJump2 = p->m_stateRingJump;
+        p->m_touchedRing = false;
+        p->m_touchedCustomRing = false;
+        p->m_touchedGravityPortal = false;
+        p->m_maybeTouchedBreakableBlock = false;
+    }
+
     void syncPlayer(PlayerObject* sim, PlayerObject* src) {
         sim->setVisible(false);
-        sim->copyAttributes(src);
+        bool modeDiff =
+            sim->m_isShip != src->m_isShip ||
+            sim->m_isBird != src->m_isBird ||
+            sim->m_isBall != src->m_isBall ||
+            sim->m_isDart != src->m_isDart ||
+            sim->m_isRobot != src->m_isRobot ||
+            sim->m_isSpider != src->m_isSpider ||
+            sim->m_isSwing != src->m_isSwing ||
+            sim->m_vehicleSize != src->m_vehicleSize ||
+            sim->m_isSideways != src->m_isSideways ||
+            sim->m_isPlatformer != src->m_isPlatformer;
+        if (sim->m_isDashing && !src->m_isDashing) {
+            sim->stopDashing();
+        }
+        if (modeDiff) {
+            sim->copyAttributes(src);
+        }
+        sim->m_playEffects = false;
+        if (sim->m_waveTrail) sim->m_waveTrail->setVisible(false);
         sim->setPosition(src->getPosition());
-        sim->setScale(src->getScale());
+        sim->m_position = src->m_position;
+        sim->m_lastPosition = src->m_lastPosition;
+        sim->setRotation(src->getRotation());
+        sim->setScaleX(src->getScaleX());
+        sim->setScaleY(src->getScaleY());
         sim->setContentSize(src->getContentSize());
         sim->m_width = src->m_width;
         sim->m_height = src->m_height;
+        sim->m_isObjectRectDirty = true;
+        sim->m_isOrientedBoxDirty = true;
+        sim->m_isSecondPlayer = src->m_isSecondPlayer;
+
+        sim->m_enable22Changes = src->m_enable22Changes;
+        sim->m_fixRobotJump = src->m_fixRobotJump;
+        sim->m_enableImpulseFix = src->m_enableImpulseFix;
+
         sim->m_gravityMod = src->m_gravityMod;
-        sim->m_isOnGround = src->m_isOnGround;
-        sim->m_isUpsideDown = src->m_isUpsideDown;
+        sim->m_gravity = src->m_gravity;
+        sim->m_yVelocity = src->m_yVelocity;
+        sim->m_fallSpeed = src->m_fallSpeed;
+        sim->m_yStart = src->m_yStart;
         sim->m_vehicleSize = src->m_vehicleSize;
         sim->m_playerSpeed = src->m_playerSpeed;
-        sim->m_yVelocity = src->m_yVelocity;
-        sim->m_gravity = src->m_gravity;
         sim->m_speedMultiplier = src->m_speedMultiplier;
+        sim->m_isUpsideDown = src->m_isUpsideDown;
+        sim->m_isGoingLeft = src->m_isGoingLeft;
+        sim->m_isSideways = src->m_isSideways;
+        sim->m_reverseRelated = src->m_reverseRelated;
+        sim->m_maybeReverseSpeed = src->m_maybeReverseSpeed;
+        sim->m_maybeReverseAcceleration = src->m_maybeReverseAcceleration;
+        sim->m_xVelocityRelated = src->m_xVelocityRelated;
+        sim->m_xVelocityRelated2 = src->m_xVelocityRelated2;
+        sim->m_isAccelerating = src->m_isAccelerating;
+        sim->m_accelerationOrSpeed = src->m_accelerationOrSpeed;
+        sim->m_isDead = false;
+        sim->m_isLocked = src->m_isLocked;
+        sim->m_controlsDisabled = src->m_controlsDisabled;
+        sim->m_inputsLocked = src->m_inputsLocked;
+        sim->m_isOutOfBounds = src->m_isOutOfBounds;
+        sim->m_fallStartY = src->m_fallStartY;
+        sim->m_rotationSpeed = src->m_rotationSpeed;
+        sim->m_rotateSpeed = src->m_rotateSpeed;
+        sim->m_isRotating = src->m_isRotating;
+        sim->m_shipRotation = src->m_shipRotation;
+
+        sim->m_isOnGround = src->m_isOnGround;
+        sim->m_isOnGround2 = src->m_isOnGround2;
+        sim->m_isOnGround3 = src->m_isOnGround3;
+        sim->m_isOnGround4 = src->m_isOnGround4;
+        sim->m_stateOnGround = src->m_stateOnGround;
+        sim->m_lastGroundedPos = src->m_lastGroundedPos;
+        sim->m_lastGroundObject = src->m_lastGroundObject;
+        sim->m_collidedObject = src->m_collidedObject;
+        sim->m_collidedTopMinY = src->m_collidedTopMinY;
+        sim->m_collidedBottomMaxY = src->m_collidedBottomMaxY;
+        sim->m_collidedLeftMaxX = src->m_collidedLeftMaxX;
+        sim->m_collidedRightMinX = src->m_collidedRightMinX;
+        sim->m_maybeIsColliding = src->m_maybeIsColliding;
+        sim->m_objectSnappedTo = src->m_objectSnappedTo;
+        sim->m_snapDistance = src->m_snapDistance;
+        sim->m_ringJumpedSincePress = src->m_ringJumpedSincePress;
+        sim->m_hasStartedFalling = src->m_hasStartedFalling;
+
+        sim->m_stateDartSlide = src->m_stateDartSlide;
+        sim->m_stateNoAutoJump = src->m_stateNoAutoJump;
+        sim->m_stateHitHead = src->m_stateHitHead;
+        sim->m_stateFlipGravity = src->m_stateFlipGravity;
+        sim->m_stateNoWallPush = src->m_stateNoWallPush;
+        sim->m_stateBoostX = src->m_stateBoostX;
+        sim->m_stateBoostY = src->m_stateBoostY;
+        sim->m_stateScale = src->m_stateScale;
+        sim->m_stateForce = src->m_stateForce;
+        sim->m_stateForceVector = src->m_stateForceVector;
+        sim->m_affectedByForces = src->m_affectedByForces;
+        sim->m_maybeIsBoosted = src->m_maybeIsBoosted;
+        sim->m_decreaseBoostSlide = src->m_decreaseBoostSlide;
+        sim->m_blackOrbRelated = src->m_blackOrbRelated;
+
+        sim->m_isOnSlope = src->m_isOnSlope;
+        sim->m_wasOnSlope = src->m_wasOnSlope;
+        sim->m_slopeVelocity = src->m_slopeVelocity;
+        sim->m_currentSlopeYVelocity = src->m_currentSlopeYVelocity;
+        sim->m_slopeRotation = src->m_slopeRotation;
+        sim->m_isCurrentSlopeTop = src->m_isCurrentSlopeTop;
+        sim->m_maybeUpsideDownSlope = src->m_maybeUpsideDownSlope;
+        sim->m_maybeGoingCorrectSlopeDirection = src->m_maybeGoingCorrectSlopeDirection;
+        sim->m_maybeSlopeForce = src->m_maybeSlopeForce;
+        sim->m_slopeEndTime = src->m_slopeEndTime;
+        sim->m_currentSlope = src->m_currentSlope;
+        sim->m_currentSlope2 = src->m_currentSlope2;
+
+        sim->m_totalTime = src->m_totalTime;
+        sim->m_lastJumpTime = src->m_lastJumpTime;
+        sim->m_lastFlipTime = src->m_lastFlipTime;
+        sim->m_lastLandTime = src->m_lastLandTime;
+        sim->m_lastSpiderFlipTime = src->m_lastSpiderFlipTime;
+        sim->m_gameModeChangedTime = src->m_gameModeChangedTime;
+        sim->m_jumpBuffered = src->m_jumpBuffered;
+        sim->m_wasJumpBuffered = src->m_wasJumpBuffered;
+        sim->m_wasRobotJump = src->m_wasRobotJump;
+        sim->m_stateJumpBuffered = src->m_stateJumpBuffered;
+        sim->m_stateRingJump = src->m_stateRingJump;
+        sim->m_stateRingJump2 = src->m_stateRingJump2;
+        sim->m_ringJumpRelated = src->m_ringJumpRelated;
+        sim->m_touchedRing = src->m_touchedRing;
+        sim->m_touchedCustomRing = src->m_touchedCustomRing;
+        sim->m_touchedGravityPortal = src->m_touchedGravityPortal;
+        sim->m_touchedPad = src->m_touchedPad;
+        sim->m_isDashing = src->m_isDashing;
+        sim->m_dashRing = src->m_dashRing;
+        sim->m_dashFireFrame = src->m_dashFireFrame;
+        sim->m_holdingButtons = src->m_holdingButtons;
         sim->m_touchedRings = src->m_touchedRings;
-        if (sim->m_touchingRings) sim->m_touchingRings->removeAllObjects();
+
+        if (sim->m_touchingRings) {
+            sim->m_touchingRings->removeAllObjects();
+            if (src->m_touchingRings && src->m_touchingRings->count() > 0) {
+                for (unsigned int i = 0; i < src->m_touchingRings->count(); ++i) {
+                    if (auto* r = src->m_touchingRings->objectAtIndex(i)) {
+                        sim->m_touchingRings->addObject(r);
+                    }
+                }
+            }
+        }
+        resetCollisionLog(sim);
     }
 
     void forceHoldObj(int s, int who, bool hold) {
@@ -1214,11 +1746,13 @@ private:
     // sets the hold state of the TARGET player
     void setHold(int s, bool hold) {
         if (m_info[s].holding[m_tp] != hold) forceHoldObj(s, m_tp, hold);
-        if (m_mirror && m_info[s].holding[1] != hold) forceHoldObj(s, 1, hold);
+        if (m_mirror) {
+            int other = 1 - m_tp;
+            if (m_info[s].holding[other] != hold) forceHoldObj(s, other, hold);
+        }
     }
 
-    // hold state the ghost starts with for a player (the target's own state is the
-    // one the game has; the other player may be assumed to mirror the target)
+    // hold state the ghost starts with for a player
     bool holdFor(int who) const {
         if (m_mirror) return m_game[0];
         if (who != m_tp && m_otherOverride >= 0) return m_otherOverride == 1;
@@ -1232,17 +1766,18 @@ private:
         m_info[s] = SlotInfo();
         m_info[s].grounded = m_p[m_tp][s]->m_isOnGround;
         m_info[s].groundTicks = m_info[s].grounded ? 1 : 0;
-        forceHoldObj(s, 0, holdFor(0));
-        if (m_two) forceHoldObj(s, 1, holdFor(1));
+        m_info[s].holding[0] = isHoldingJump(m_p[0][s]);
+        if (m_info[s].holding[0] != holdFor(0)) forceHoldObj(s, 0, holdFor(0));
+        if (m_two) {
+            m_info[s].holding[1] = isHoldingJump(m_p[1][s]);
+            if (m_info[s].holding[1] != holdFor(1)) forceHoldObj(s, 1, holdFor(1));
+        }
     }
 
     void copySlot(int dst, int src) {
         syncPlayer(m_p[0][dst], m_p[0][src]);
         if (m_two) syncPlayer(m_p[1][dst], m_p[1][src]);
-        SlotInfo keep = m_info[src];
-        m_info[dst] = keep;
-        forceHoldObj(dst, 0, keep.holding[0]);
-        if (m_two) forceHoldObj(dst, 1, keep.holding[1]);
+        m_info[dst] = m_info[src];
     }
 
     CCPoint pos(int s) const { return m_p[m_tp][s]->getPosition(); }
@@ -1288,15 +1823,44 @@ private:
         m_stepDtNow = dt;
 
         bool wasHold = m_info[s].holding[m_tp];
-        setHold(s, hold);
         m_simDead = false;
         m_stepObj[0] = a;
         m_stepObj[1] = b;
         m_stepEdge[0] = m_stepEdge[1] = false;
+        m_orb.done[0] = m_orb.done[1] = false;
         m_stepEdge[m_tp] = hold && !wasHold;
-        if (m_mirror) m_stepEdge[1] = m_stepEdge[0];
+        if (m_mirror) m_stepEdge[1 - m_tp] = m_stepEdge[m_tp];
         m_curSlot = s;
         m_hitUnknown = false;
+
+        setHold(s, hold);
+
+        auto preUpdateOrb = [&](PlayerObject* p, int who) {
+            if (!p || !m_stepEdge[who] || m_orb.done[who] || !p->m_touchingRings ||
+                p->m_touchingRings->count() == 0 || !canFireOrbNow(p, who)) {
+                return;
+            }
+            CCRect pr = p->getObjectRect();
+            RingObject* best = nullptr;
+            float bestD = std::numeric_limits<float>::max();
+            for (unsigned int i = 0; i < p->m_touchingRings->count(); ++i) {
+                auto* ring = geode::cast::typeinfo_cast<RingObject*>(p->m_touchingRings->objectAtIndex(i));
+                if (!ring || !isSimOrb(ring) || isRingConsumed(s, who, ring)) continue;
+                CCRect rr = ring->getObjectRect();
+                if (!rr.intersectsRect(pr)) continue;
+                float dx = rr.getMidX() - pr.getMidX();
+                float dy = rr.getMidY() - pr.getMidY();
+                float d = dx * dx + dy * dy;
+                if (d < bestD) { bestD = d; best = ring; }
+            }
+            if (best) {
+                m_active = p;
+                p->m_stateRingJump = true;
+                p->ringJump(best, true);
+            }
+        };
+        preUpdateOrb(a, 0);
+        preUpdateOrb(b, 1);
 
         if (a) {
             float ax = a->getPositionX();
@@ -1321,13 +1885,17 @@ private:
 
         if (a) {
             m_active = a;
+            if (a->m_touchingRings) a->m_touchingRings->removeAllObjects();
             resetCollisionLog(a);
             pl->checkCollisions(a, dt, false);
+            simUpdateJumpVars(a);
         }
         if (!m_simDead && b) {
             m_active = b;
+            if (b->m_touchingRings) b->m_touchingRings->removeAllObjects();
             resetCollisionLog(b);
             pl->checkCollisions(b, dt, false);
+            simUpdateJumpVars(b);
         }
         m_active = nullptr;
         if (m_simDead) return false;
@@ -1394,7 +1962,7 @@ private:
         int ticks = 0;          // ticks simulated before it ended
         int end = 0;            // 0 = stayed on the path the whole look-ahead, 1 = left the path,
                                 // 2 = died, 3 = unknown / out of budget
-        bool blue = false;      // a click really activated a blue orb
+        bool hitOrb = false;    // a click really activated an unconsumed gameplay orb
     };
 
     // The painted path: every orb (hitbox padded), plus the box joining each pair of
@@ -1420,15 +1988,15 @@ private:
         OrbRun r;
         loadReal(slot);
         m_info[slot].groundTicks = 0;
+        orbBegin(false);
         for (int t = 0; t < H; ++t) {
             const bool hold = clickAt >= 0 && t >= clickAt && t < clickAt + tap;
-            long before = m_dbgBlueHit;
             if (!step(slot, hold)) {
                 r.ticks = t;
                 r.end = m_aborted ? 3 : 2;
                 return r;
             }
-            if (m_dbgBlueHit != before) r.blue = true;
+            if (orbUsed()) r.hitOrb = true;
             if (m_info[slot].unknown) {
                 r.ticks = t;
                 r.end = 3;
@@ -1555,7 +2123,7 @@ private:
     //    delay that pushes the death position back the most wins (it must beat
     //    the earlier delays by `holdGain` ticks);
     //  - anything else passes untouched, so the controls stay free.
-    Decision decideHold(PlayLayer* pl, Mode mode, int pi, bool target) {
+    Decision decideHold(PlayLayer* pl, Mode mode, int pi, bool target, bool mirror = false) {
         auto& c = cfg();
         Decision r;
         int maxDelay = c.maxDelay[mode];
@@ -1564,7 +2132,8 @@ private:
         int imminent = mode == M_WAVE ? c.waveImminent : c.shipImminent;
         int gain = std::max(1, c.holdGain);
 
-        beginSearch(pl, pi);
+        beginSearch(pl, pi, true, mirror);
+        orbBegin(target);
         loadReal(0);
 
         int foundDelay = -1;

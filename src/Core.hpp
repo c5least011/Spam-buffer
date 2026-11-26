@@ -11,21 +11,21 @@ namespace sb {
 // This is important in dual mode: P1 and P2 must never share a CPS history or
 // a logical held state, otherwise one side can suppress or overwrite the other.
 //
-// Wave spam is a delay buffer: the decision (how many ticks to hold an event
-// back) comes from the ghost-player engine (Engine.hpp) through the `decide`
-// callback of onReal(). The lane only stores the held-back events in order and
-// injects them itself, one per step, so lastGameToggle / gameDown stay exact.
+// Wave / Ship / Orb buffering uses the ghost-player engine (Engine.hpp) through
+// the `decide` callback of onReal(). The lane stores held-back events in physics-tick
+// order and injects them at the start of each physics tick (fireDueWave).
 struct InputLane {
     EventStream stream;
     OrbGuard orb;
 
-    std::deque<Pend> pend;          // held-back wave events, in order
-    uint64_t lastArr = 0;           // step the last held-back event arrived
-    uint64_t lastDelayStep = 0;     // last time a delay was applied (HUD)
-    int lastDelay = 0;              // its length, in ticks (HUD)
+    std::deque<Pend> pend;          // held-back wave/ship/orb events, in physics ticks
+    uint64_t lastArr = 0;           // physics tick the last held-back event arrived
+    uint64_t lastDelayStep = 0;     // step the last delay was applied (HUD)
+    int lastDelay = 0;              // its length, in physics ticks (HUD)
     uint64_t delayed = 0;           // events delayed since the last reset (HUD)
 
     uint64_t lastPress = 0;         // step of the last physical press on this side
+    uint64_t lastPressTick = 0;     // physics tick of the last physical press on this side
     bool everPressed = false;
 
     uint64_t lastGameToggle = 0;
@@ -41,6 +41,7 @@ struct InputLane {
         stream.clear();
         orb.reset();
         lastPress = 0;
+        lastPressTick = 0;
         everPressed = false;
         pend.clear();
         lastArr = 0;
@@ -59,22 +60,61 @@ struct InputLane {
 
     // Record one physical input for this side only. While FP owns the lane,
     // physical events update its activity timer but are not forwarded twice.
-    // `decide(down)` is asked ONLY for an event that would change the game's
-    // button state right now; it returns the number of ticks to hold it back.
-    // `tick` = index of the next physics tick (the engine's clock): held-back events
-    // are counted and fired in those ticks, not in input-queue steps.
+    // `decide(down)` returns the number of physics ticks to hold the event back (0 = pass).
     template <class Decide>
     bool onReal(uint64_t step, uint64_t tick, bool down, const Cfg& cfg, bool fpOwns, Decide&& decide) {
         bool forward = !fpOwns && down != gameDown;
-        if (!fpOwns && (cfg.wave || cfg.ship)) {
+        if (!fpOwns && (cfg.wave || cfg.ship || cfg.orb)) {
             if (!pend.empty()) {
-                // an earlier event is still held back: stay behind it and keep
-                // the spacing the player had (no new search)
-                const uint64_t gap = std::max<uint64_t>(1, tick - lastArr);
-                pend.push_back({pend.back().at + gap, down});
-                lastArr = tick;
-                forward = false;
-            } else if (forward) {
+                if (cfg.orb) {
+                    // Orb buffer only buffers presses; keep a clean release right after a pending press.
+                    if (!down && pend.back().down) {
+                        uint64_t relAt = pend.back().at + std::max<uint64_t>(1, uint64_t(Cfg::orbTap));
+                        pend.push_back({relAt, false});
+                        lastArr = tick;
+                        forward = false;
+                    } else if (down) {
+                        // A brand-new press while an old orb tap is pending: drop stale tail release and evaluate fresh.
+                        pend.clear();
+                        if (down != gameDown) {
+                            const int delay = decide(true);
+                            if (delay > 0) {
+                                pend.push_back({tick + uint64_t(delay), true});
+                                lastArr = tick;
+                                lastDelayStep = step;
+                                lastDelay = delay;
+                                ++delayed;
+                                forward = false;
+                            } else {
+                                forward = true;
+                            }
+                        } else {
+                            forward = false;
+                        }
+                    } else {
+                        forward = false;
+                    }
+                } else {
+                    // Wave / Ship: avoid runaway queue pile-up during rapid spam so `decide()` stays active!
+                    if (pend.back().down == down) {
+                        forward = false;
+                    } else if (pend.size() >= 2) {
+                        // Queue already has a delayed pair pending: collapse the tail so latency never snowballs,
+                        // and preserve the player's latest toggle right after the front event.
+                        uint64_t nextAt = std::max(tick, pend.front().at + 1);
+                        pend.resize(1);
+                        pend.push_back({nextAt, down});
+                        lastArr = tick;
+                        forward = false;
+                    } else {
+                        const uint64_t rawGap = tick > lastArr ? (tick - lastArr) : 1;
+                        const uint64_t gap = std::clamp<uint64_t>(rawGap, 1, 8);
+                        pend.push_back({pend.back().at + gap, down});
+                        lastArr = tick;
+                        forward = false;
+                    }
+                }
+            } else if (forward && (!cfg.orb || down)) {
                 const int delay = decide(down);
                 if (delay > 0) {
                     pend.push_back({tick + uint64_t(delay), down});
@@ -86,12 +126,13 @@ struct InputLane {
                 }
             }
         }
-        stream.push(step, double(step) / double(std::max(1, cfg.tps)), down,
+        stream.push(step, tick, double(step) / double(std::max(1, cfg.tps)), down,
                     Origin::Player, forward);
         playerDown = down;
         modRun = 0;
         if (down) {
             lastPress = step;
+            lastPressTick = tick;
             everPressed = true;
         }
         if (forward) {
@@ -101,9 +142,8 @@ struct InputLane {
         return forward;
     }
 
-    // Held-back events are fired by main.cpp at the start of each physics tick
-    // (fireDueWave). Here we only drop the queue when wave control is no longer in
-    // charge (left wave / switched off): the game goes back to the finger's state.
+    // Held-back events are fired by main.cpp at the start of each physics tick (fireDueWave).
+    // Only drop the queue when buffering is no longer in charge (left vehicle / switched off).
     Action flushPending(const View& view) {
         if (pend.empty() || (view.valid && view.buffered)) return {};
         pend.clear();
@@ -119,20 +159,32 @@ struct InputLane {
         mode = Mode::None;
     }
 
-    // Half a click cycle of the player's spam, in steps (mean gap between the last
-    // physical toggles). The ship ghost assumes the spam goes on at this rhythm.
-    int halfPeriod() const {
-        uint64_t prev = 0, sum = 0;
-        int n = 0;
-        for (auto it = stream.ev.rbegin(); it != stream.ev.rend() && n < 6; ++it) {
+    // Measure the player's actual spam rhythm in PHYSICS TICKS:
+    // separate median hold duration (`outHold`) and release duration (`outRel`),
+    // so ship prediction reflects asymmetric real ship duty cycles (e.g. 42% hold / 58% release).
+    void spamDurations(int& outHold, int& outRel) const {
+        std::deque<float> holds, rels;
+        bool haveNext = false;
+        uint64_t nextTick = 0;
+        bool nextDown = false;
+        for (auto it = stream.ev.rbegin(); it != stream.ev.rend() && (holds.size() < 6 || rels.size() < 6); ++it) {
             if (it->origin != Origin::Player) continue;
-            if (prev && prev > it->step) {
-                sum += prev - it->step;
-                ++n;
+            if (haveNext && nextTick > it->tick && nextDown != it->down) {
+                uint64_t d = nextTick - it->tick;
+                if (d >= 1 && d <= 40) {
+                    if (it->down) {
+                        if (holds.size() < 6) holds.push_back(float(d));
+                    } else {
+                        if (rels.size() < 6) rels.push_back(float(d));
+                    }
+                }
             }
-            prev = it->step;
+            nextTick = it->tick;
+            nextDown = it->down;
+            haveNext = true;
         }
-        return n ? int(sum / uint64_t(n)) : 3;
+        outHold = holds.empty() ? 4 : std::clamp(int(std::lround(medianOf(holds))), 2, 16);
+        outRel = rels.empty() ? 5 : std::clamp(int(std::lround(medianOf(rels))), 2, 16);
     }
 
     // This side recently got physical input: it takes part in Frame Perfect.
@@ -140,23 +192,29 @@ struct InputLane {
         return everPressed && step - lastPress <= uint64_t(std::max(1, cfg.tps));
     }
 
-    // Wave control / orb only (Frame Perfect is decided once for everybody in Core).
-    template <class Verdict>
-    Action onStep(uint64_t step, const View& view, const Cfg& cfg, Verdict&& verdict) {
-        Action action;
-        action = flushPending(view);
-        if (!pend.empty() || (lastDelayStep && step - lastDelayStep < 30))
-            mode = Mode::Wave;
-        if (!action.want && pend.empty() && view.valid) {
-            action = orb.step(step, view, gameDown, playerDown, cfg.orb, spamming(step, cfg), verdict);
-            if (orb.engaged || orb.modHeld) mode = Mode::Orb;
+    // Step bookkeeping + flush when leaving buffered mode (orb rescue runs on physics ticks via stepOrbTick).
+    Action onStep(uint64_t step, const View& view, const Cfg& cfg) {
+        Action action = flushPending(view);
+        if (!pend.empty() || (lastDelayStep && step - lastDelayStep < 30)) {
+            mode = cfg.orb ? Mode::Orb : Mode::Wave;
         }
+        if (orb.engaged || orb.modHeld) mode = Mode::Orb;
         if (action.want && action.down == gameDown) action = {};
         return action;
     }
 
-    void committed(uint64_t step, const Action& action, const Cfg& cfg) {
-        stream.push(step, double(step) / double(std::max(1, cfg.tps)),
+    // Physics-tick orb rescue (called at start of physics tick, aligned with the ghost engine).
+    template <class Verdict>
+    Action onOrbTick(uint64_t tick, float tps, const View& view, const Cfg& cfg, Verdict&& verdict) {
+        if (!pend.empty()) return {};
+        Action action = orb.step(tick, view, gameDown, playerDown, cfg.orb, spammingTicks(tick, tps), verdict);
+        if (orb.engaged || orb.modHeld) mode = Mode::Orb;
+        if (action.want && action.down == gameDown) action = {};
+        return action;
+    }
+
+    void committed(uint64_t step, uint64_t tick, const Action& action, const Cfg& cfg) {
+        stream.push(step, tick, double(step) / double(std::max(1, cfg.tps)),
                     action.down, Origin::Mod, true);
         gameDown = action.down;
         lastGameToggle = step;
@@ -165,19 +223,19 @@ struct InputLane {
         ++assists;
     }
 
-    // The player is spamming: at least two presses in the last Cfg::orbSpamWindow
-    // seconds and the latest one no older than Cfg::orbSpamIdle.
-    bool spamming(uint64_t step, const Cfg& cfg) const {
-        const double tps = double(std::max(1, cfg.tps));
-        const uint64_t win = uint64_t(Cfg::orbSpamWindow * tps);
-        const uint64_t idle = uint64_t(Cfg::orbSpamIdle * tps);
+    // The player is actively spamming (measured in physics ticks so it works at any FPS/TPS):
+    // at least two physical presses in the last Cfg::orbSpamWindow seconds and latest <= Cfg::orbSpamIdle.
+    bool spammingTicks(uint64_t tick, float tps) const {
+        const double rate = double(std::max(30.f, tps));
+        const uint64_t win = uint64_t(Cfg::orbSpamWindow * rate);
+        const uint64_t idle = uint64_t(Cfg::orbSpamIdle * rate);
         int presses = 0;
         bool recent = false;
         for (auto it = stream.ev.rbegin(); it != stream.ev.rend(); ++it) {
-            if (it->step + win < step) break;
+            if (it->tick + win < tick) break;
             if (it->origin == Origin::Player && it->down) {
                 ++presses;
-                if (it->step + idle >= step) recent = true;
+                if (it->tick + idle >= tick) recent = true;
             }
         }
         return presses >= 2 && recent;
@@ -204,16 +262,17 @@ struct InputLane {
 };
 
 // Arbiter shared by the two independent input lanes. Frame Perfect has priority
-// over orb/wave assistance separately on each side.
+// over orb/wave/ship assistance separately on each side.
 struct Core {
     Cfg cfg;
     InputLane p1;
     InputLane p2;
     FramePerfect fp;                // ONE Frame Perfect for everybody: CPS counted over all input
 
-    std::vector<OrbPt> orbs;        // every blue orb of the level, sorted by x0
+    std::vector<OrbPt> orbs;        // every gameplay spam orb of the level, sorted by x0
     std::vector<OrbZone> zones;     // groups of orbs, sorted by x0
-    bool dual = false;                   // two separate lanes (real 2-player mode): show P2
+    View lastViews[2];              // latest views cached for physics-tick orb rescue
+    bool dual = false;              // two separate lanes (real 2-player mode): show P2
 
     // raw input counters, shown in the CPS window while TRAJECTORY is on
     struct Dbg {
@@ -235,6 +294,8 @@ struct Core {
         p1.reset(step);
         p2.reset(step);
         fp.reset();
+        lastViews[0] = View{};
+        lastViews[1] = View{};
         dbg = Dbg{};
     }
     void onPause() { reset(); }
@@ -247,7 +308,7 @@ struct Core {
         return lane(isPlayer1).onReal(step, tick, down, cfg, fpOwns, std::forward<Decide>(decide));
     }
 
-    // Index of the blue-orb zone x is inside (or within `margin` of), else -1.
+    // Index of the orb zone x is inside (or within `margin` of), else -1.
     int zoneIndex(float x, float margin) const {
         auto it = std::upper_bound(zones.begin(), zones.end(), x + margin,
             [](float v, const OrbZone& z) { return v < z.x0; });
@@ -256,10 +317,10 @@ struct Core {
         return x <= it->x1 + margin ? int(it - zones.begin()) : -1;
     }
 
-    // verdict(isPlayer1) -> bool: "a rescue tap is needed now" (ghost engine)
-    template <class Verdict>
-    std::array<Action, 2> onStep(const View& view1, const View& view2, Verdict&& verdict) {
+    std::array<Action, 2> onStep(const View& view1, const View& view2) {
         ++step;
+        lastViews[0] = view1;
+        lastViews[1] = view2;
         std::array<Action, 2> actions{};
         if (!active) return actions;
 
@@ -289,7 +350,7 @@ struct Core {
                 // FP just ended: every side goes back to its own finger
                 if (lane.gameDown != lane.playerDown) a = {true, lane.playerDown, Source::Sync};
             } else {
-                a = lane.onStep(step, *views[i], cfg, [&, i] { return verdict(i == 0); });
+                a = lane.onStep(step, *views[i], cfg);
             }
             if (a.want && a.down == lane.gameDown) a = {};
             actions[i] = a;
@@ -297,24 +358,27 @@ struct Core {
         return actions;
     }
 
-    void committed(bool isPlayer1, const Action& action) {
-        lane(isPlayer1).committed(step, action, cfg);
+    void committed(bool isPlayer1, uint64_t tick, const Action& action) {
+        lane(isPlayer1).committed(step, tick, action, cfg);
     }
 
     std::string hud() const {
         auto laneText = [this](const InputLane& input) {
-            char wave[40];
-            if (!(cfg.wave || cfg.ship)) std::snprintf(wave, sizeof wave, "off");
-            else if (!input.pend.empty()) std::snprintf(wave, sizeof wave, "HOLD %zu", input.pend.size());
-            else if (input.delayed) std::snprintf(wave, sizeof wave, "on d%d x%llu", input.lastDelay,
+            char bufSt[48];
+            if (!(cfg.wave || cfg.ship || cfg.orb)) std::snprintf(bufSt, sizeof bufSt, "off");
+            else if (!input.pend.empty()) std::snprintf(bufSt, sizeof bufSt, "HOLD %zu", input.pend.size());
+            else if (cfg.orb && (input.orb.rescues || input.delayed))
+                std::snprintf(bufSt, sizeof bufSt, "orb d%d r%llu", input.lastDelay,
+                              (unsigned long long)input.orb.rescues);
+            else if (input.delayed) std::snprintf(bufSt, sizeof bufSt, "on d%d x%llu", input.lastDelay,
                                                   (unsigned long long)input.delayed);
-            else std::snprintf(wave, sizeof wave, "on");
+            else std::snprintf(bufSt, sizeof bufSt, "on");
             char b[224];
             std::snprintf(b, sizeof b,
                 "%s:%s  cps:%.1f  fp:%s %.1f/%.1f  buf:%s",
                 input.modeName(), input.assists && step - input.lastAssistStep < 30 ? "ON" : "off",
                 input.inputCps(step, cfg), fp.active ? "ACTIVE" : (cfg.fp ? "armed" : "off"),
-                fp.targetCps(cfg), fp.minimumCps(cfg), wave);
+                fp.targetCps(cfg), fp.minimumCps(cfg), bufSt);
             return std::string(b);
         };
 

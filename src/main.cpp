@@ -9,6 +9,7 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/GameObject.hpp>
+#include <Geode/modify/EnhancedGameObject.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
 #include <Geode/modify/RingObject.hpp>
 #include <Geode/modify/HardStreak.hpp>
@@ -32,9 +33,9 @@ using buf::g_engine;
 namespace sb {
 inline bool g_injecting = false;
 
-// Wave, Ship and Frame Perfect are mutually exclusive: turning one on turns the other
-// two off, so two assist engines can never fight over the same input.
-// "wave" / "ship" / "fp" selects the mode; on=false just switches it off.
+// Wave, Ship, Frame Perfect and Orb are mutually exclusive: turning one on turns the
+// others off, so two assist engines can never fight over the same input.
+// "wave" / "ship" / "fp" / "orb" selects the mode; on=false just switches it off.
 inline void setExclusiveMode(const char* mode, bool on) {
     auto* mod = Mod::get();
     auto& c = Core::get().cfg;
@@ -42,10 +43,11 @@ inline void setExclusiveMode(const char* mode, bool on) {
     c.wave = on && m == "wave";
     c.ship = on && m == "ship";
     c.fp = on && m == "fp";
-    c.orb = false;   // Orb assist: coming soon
+    c.orb = on && m == "orb";
     mod->setSavedValue("cfg.wave-enabled", c.wave);
     mod->setSavedValue("cfg.ship-enabled", c.ship);
     mod->setSavedValue("cfg.fp-enabled", c.fp);
+    mod->setSavedValue("cfg.orb-enabled", c.orb);
 }
 
 inline void setFramePerfectEnabled(bool enabled) {
@@ -65,7 +67,7 @@ static void refreshCfg() {
     c.wave = mod->getSavedValue<bool>("cfg.wave-enabled", true);
     c.ship = mod->getSavedValue<bool>("cfg.ship-enabled", false);
     c.fp = mod->getSavedValue<bool>("cfg.fp-enabled", false);
-    c.orb = false;   // Orb assist: coming soon
+    c.orb = mod->getSavedValue<bool>("cfg.orb-enabled", false);
     c.hud = mod->getSavedValue<bool>("cfg.hud-enabled", true);
     c.traj = mod->getSavedValue<bool>("cfg.traj-enabled", false);
     c.waveDelay = mod->getSavedValue<int>("cfg.wave-delay", 6);
@@ -75,21 +77,23 @@ static void refreshCfg() {
     c.fpCps = mod->getSavedValue<float>("cfg.fp-cps", 30.f);
     c.tps = mod->getSavedValue<int>("cfg.tps", 240);
     c.fpSlowerCps = mod->getSavedValue<float>("cfg.fp-slower-cps", 3.f);
-    c.orbLookahead = mod->getSavedValue<int>("cfg.orb-lookahead", 40);
+    c.orbDelay = mod->getSavedValue<int>("cfg.orb-delay", 5);
+    c.orbLookahead = mod->getSavedValue<int>("cfg.orb-lookahead", 36);
 
     c.tps = std::clamp(c.tps, 30, 10000);
     c.fpCps = std::clamp(c.fpCps, 1.f, float(c.tps) * 0.5f);
     c.fpSlowerCps = std::clamp(c.fpSlowerCps, 0.f, std::max(0.f, c.fpCps - 0.1f));
-    // never more than one mode (priority FP > Wave > Ship), whatever was saved
-    if (c.fp) { c.wave = false; c.ship = false; }
-    else if (c.wave) { c.ship = false; }
-    c.orb = false;
+    // never more than one mode (priority FP > Wave > Ship > Orb), whatever was saved
+    if (c.fp) { c.wave = c.ship = c.orb = false; }
+    else if (c.wave) { c.ship = c.orb = false; }
+    else if (c.ship) { c.orb = false; }
 
     c.waveDelay = std::clamp(c.waveDelay, 0, 8);
     c.waveLook = std::clamp(c.waveLook, 13, 18);
     c.shipDelay = std::clamp(c.shipDelay, 0, 12);
     c.shipLook = std::clamp(c.shipLook, 12, 36);
-    c.orbLookahead = std::clamp(c.orbLookahead, 10, 120);
+    c.orbDelay = std::clamp(c.orbDelay, 0, 10);
+    c.orbLookahead = std::clamp(c.orbLookahead, 15, 80);
 
     // Ghost-player engine (wave buffer). Imminent is fixed at 8; delay 0 = off.
     auto& b = buf::cfg();
@@ -165,7 +169,7 @@ protected:
         m_mainLayer->addChild(m_content, 5);
 
         auto& c = sb::Core::get().cfg;
-        s_tab = c.fp ? 2 : ((c.ship && !c.wave) ? 1 : 0);
+        s_tab = c.fp ? 2 : (c.orb ? 3 : ((c.ship && !c.wave) ? 1 : 0));
         build();
         return true;
     }
@@ -254,7 +258,7 @@ protected:
 
         // --- the assist modes; each pill also picks the settings shown below
         const char* names[4] = {"WAVE", "SHIP", "FP", "ORB"};
-        const bool states[4] = {c.wave, c.ship, c.fp, false};
+        const bool states[4] = {c.wave, c.ship, c.fp, c.orb};
         const float px[4] = {35.f, 99.f, 163.f, 227.f};
         for (int i = 0; i < 4; ++i) {
             auto* item = makePill(names[i], menu_selector(SBConfigPopup::onToggle), states[i], 58.f);
@@ -328,7 +332,22 @@ protected:
                          sb::refreshCfg();
                      });
         } else {
-            addLabel("Orb assist: coming soon", {135.f, 84.f}, 0.5f, gold);
+            addInput({70.f, 80.f}, "Delay (0-10)", std::to_string(c.orbDelay), false,
+                     [](std::string const& s) {
+                         int v;
+                         if (!sb::parseInt(s, v)) return;
+                         Mod::get()->setSavedValue("cfg.orb-delay", std::clamp(v, 0, 10));
+                         sb::refreshCfg();
+                     });
+            addInput({200.f, 80.f}, "Look (15-80)", std::to_string(c.orbLookahead), false,
+                     [](std::string const& s) {
+                         int v;
+                         if (!sb::parseInt(s, v)) return;
+                         Mod::get()->setSavedValue("cfg.orb-lookahead", std::clamp(v, 15, 80));
+                         sb::refreshCfg();
+                     });
+            addLabel("Buffers early clicks & rescues missed orbs", {135.f, 50.f}, 0.34f,
+                     ccc3(180, 180, 180));
         }
 
         // --- general
@@ -350,7 +369,7 @@ protected:
             case 0: s_tab = 0; sb::setExclusiveMode("wave", !sb::Core::get().cfg.wave); break;
             case 1: s_tab = 1; sb::setExclusiveMode("ship", !sb::Core::get().cfg.ship); break;
             case 2: s_tab = 2; sb::setExclusiveMode("fp", !sb::Core::get().cfg.fp); break;
-            case 3: s_tab = 3; break;   // Orb assist: coming soon (just shows its tab)
+            case 3: s_tab = 3; sb::setExclusiveMode("orb", !sb::Core::get().cfg.orb); break;
             case 5: mod->setSavedValue("cfg.hud-enabled", !sb::Core::get().cfg.hud); break;
             case 6: mod->setSavedValue("cfg.traj-enabled", !sb::Core::get().cfg.traj); break;
             default: return;
@@ -379,17 +398,18 @@ public:
 };
 
 
-// Scan the level once: every blue (gravity) orb, grouped into zones of orbs that
-// sit close together. The orb rescue only runs the ghost inside a zone.
+// Scan the level once: every standard gameplay spam orb (yellow, blue, pink, green,
+// black, red, spider), grouped into zones of orbs that sit close together.
 static void buildOrbZones(PlayLayer* pl) {
     auto& core = sb::Core::get();
     core.orbs.clear();
     core.zones.clear();
     if (!pl || !pl->m_objects) return;
     for (auto* obj : CCArrayExt<GameObject*>(pl->m_objects)) {
-        if (!obj || obj->m_objectID != 84) continue;
+        if (!obj || obj->m_isDisabled || obj->m_isDisabled2) continue;
+        if (!buf::Engine::isSpamOrbId(obj->m_objectID)) continue;
         auto r = obj->getObjectRect();
-        core.orbs.push_back({r.getMinX(), r.getMaxX(), r.getMinY(), r.getMaxY()});
+        core.orbs.push_back({r.getMinX(), r.getMaxX(), r.getMinY(), r.getMaxY(), obj->m_objectID});
     }
     std::sort(core.orbs.begin(), core.orbs.end(),
               [](sb::OrbPt const& a, sb::OrbPt const& b) { return a.x0 < b.x0; });
@@ -407,23 +427,44 @@ static void buildOrbZones(PlayLayer* pl) {
 }
 
 namespace sb {
-// Wave control: fire the held-back press / release whose tick has come. Same moment
-// as the input buffer mod (start of the physics tick, before the player moves), one
-// event per tick and lane.
+// Physics-tick dispatcher:
+//  1) Fires any held-back wave/ship/orb press/release whose physics tick has arrived.
+//  2) Runs physics-tick Orb Spam rescue while the player is actively spamming & finger is up.
 static void fireDueWave(Core& core, uint64_t now) {
     auto* pl = PlayLayer::get();
     if (!pl) return;
     for (int i = 0; i < 2; ++i) {
         auto& lane = core.lane(i == 0);
-        if (lane.pend.empty() || lane.pend.front().at > now) continue;
-        const Pend e = lane.pend.front();
-        lane.pend.pop_front();
-        if (e.down == lane.gameDown) continue;
-        g_injecting = true;
-        pl->handleButton(e.down, 1, i == 0);
-        g_injecting = false;
-        ++core.dbg.inj;
-        core.committed(i == 0, Action{true, e.down, Source::Wave});
+        bool fired = false;
+        while (!lane.pend.empty() && lane.pend.front().at <= now) {
+            const Pend e = lane.pend.front();
+            lane.pend.pop_front();
+            if (e.down == lane.gameDown) continue;
+            g_injecting = true;
+            pl->handleButton(e.down, 1, i == 0);
+            g_injecting = false;
+            ++core.dbg.inj;
+            core.committed(i == 0, now, Action{true, e.down, core.cfg.orb ? Source::Orb : Source::Wave});
+            fired = true;
+            break; // at most one toggle per physics tick per lane
+        }
+        if (!fired && core.cfg.orb && !core.fp.active && core.active) {
+            const auto& view = core.lastViews[i];
+            Action orbAct = lane.onOrbTick(now, g_engine.sbTps(), view, core.cfg, [&] {
+                if (view.orbZone < 0 || view.orbZone >= int(core.zones.size())) return false;
+                const auto& z = core.zones[view.orbZone];
+                return g_engine.sbOrbRescue(pl, i == 0, core.p1.gameDown, core.p2.gameDown,
+                                            lane.gameDown, core.cfg.orbLookahead,
+                                            core.orbs.data() + z.first, z.count);
+            });
+            if (orbAct.want) {
+                g_injecting = true;
+                pl->handleButton(orbAct.down, 1, i == 0);
+                g_injecting = false;
+                ++core.dbg.inj;
+                core.committed(i == 0, now, orbAct);
+            }
+        }
     }
 }
 }
@@ -436,35 +477,59 @@ class $modify(SBBase, GJBaseGameLayer) {
         (void)self.setHookPriority("GJBaseGameLayer::playerTouchedRing", -1000000);
     }
 
-    // ---- ghost-player support (the wave buffer simulates on hidden players)
+    // ---- ghost-player support (wave / ship / orb buffer simulates on hidden players)
     bool canBeActivatedByPlayer(PlayerObject* p0, EffectGameObject* p1) {
-        if (g_engine.isSimulating()) return g_engine.canSimRing(p0, p1);
+        if (g_engine.isSimulating()) return g_engine.canSimRingTouch(p0, p1);
         return GJBaseGameLayer::canBeActivatedByPlayer(p0, p1);
     }
 
     void collisionCheckObjects(PlayerObject* player, std::vector<GameObject*>* vec, int objectsCount, float dt) {
         if (g_engine.isSimulating()) {
-            g_engine.simTouchObjects(player, vec, objectsCount);   // gravity / speed portals, unknown objects
+            struct MovedObj {
+                GameObject* obj;
+                CCPoint pos;
+                CCPoint lastPos;
+            };
+            thread_local std::vector<GameObject*> cand;
             thread_local std::vector<GameObject*> extra;
-            thread_local std::vector<std::pair<GameObject*, CCPoint>> moved;
+            thread_local std::vector<MovedObj> moved;
+            cand.clear();
             extra.clear();
             moved.clear();
-            if (extra.capacity() < static_cast<size_t>(objectsCount)) {
-                extra.reserve(objectsCount);
+            if (cand.capacity() < static_cast<size_t>(objectsCount)) {
+                cand.reserve(objectsCount);
             }
-            for (int i = 0; i < objectsCount; i++) {
+            for (int i = 0; i < objectsCount; ++i) {
                 GameObject* obj = vec->at(i);
-                if (!obj) continue;
-                if (obj->m_groups && obj->m_groups->at(0) != 0) {
+                if (!obj || obj->m_isDisabled || obj->m_isDisabled2 || obj->m_isGroupDisabled) continue;
+                if (!buf::Engine::isRelevantSimObject(obj)) continue;
+                cand.push_back(obj);
+            }
+            int candCount = static_cast<int>(cand.size());
+            if (extra.capacity() < static_cast<size_t>(candCount)) {
+                extra.reserve(candCount);
+            }
+            for (int i = 0; i < candCount; ++i) {
+                GameObject* obj = cand[i];
+                if (obj->m_groups && obj->m_groupCount > 0 && obj->m_groups->at(0) != 0) {
                     CCPoint off;
                     auto st = g_engine.simMove(obj, off);
                     if (st == buf::Engine::MoveState::Predicted) {
-                        moved.emplace_back(obj, obj->getPosition());   // restored right after the check
-                        obj->setPosition(obj->getPosition() + off);
+                        if (off.x != 0.f || off.y != 0.f) {
+                            CCPoint orig = obj->getPosition();
+                            moved.push_back({obj, orig, obj->m_lastPosition});
+                            obj->setPosition(orig + off);
+                            obj->m_isObjectRectDirty = true;
+                            obj->m_isOrientedBoxDirty = true;
+                        }
                     } else if (st == buf::Engine::MoveState::Unknown) {
-                        g_engine.flagMovingObject();       // moving, speed unknown: do not trust it
+                        g_engine.flagMovingObject();
                     }
                 }
+            }
+            g_engine.simTouchObjects(player, &cand, candCount);
+            for (int i = 0; i < candCount; ++i) {
+                GameObject* obj = cand[i];
                 auto type = obj->m_objectType;
                 if (type == GameObjectType::Solid ||
                     type == GameObjectType::Hazard ||
@@ -474,12 +539,17 @@ class $modify(SBBase, GJBaseGameLayer) {
                     type == GameObjectType::NormalGravityPortal ||
                     type == GameObjectType::InverseGravityPortal ||
                     type == GameObjectType::GravityTogglePortal ||
-                    geode::cast::typeinfo_cast<RingObject*>(obj)) {
+                    buf::Engine::isSimOrb(obj)) {
                     extra.push_back(obj);
                 }
             }
-            GJBaseGameLayer::collisionCheckObjects(player, &extra, extra.size(), dt);
-            for (auto& mv : moved) mv.first->setPosition(mv.second);
+            GJBaseGameLayer::collisionCheckObjects(player, &extra, static_cast<int>(extra.size()), dt);
+            for (auto& mv : moved) {
+                mv.obj->setPosition(mv.pos);
+                mv.obj->m_lastPosition = mv.lastPos;
+                mv.obj->m_isObjectRectDirty = true;
+                mv.obj->m_isOrientedBoxDirty = true;
+            }
             moved.clear();
             return;
         }
@@ -491,7 +561,7 @@ class $modify(SBBase, GJBaseGameLayer) {
 
     void playerTouchedRing(PlayerObject* player, RingObject* ring) {
         if (g_engine.isSimulating()) {
-            if (g_engine.canSimRing(player, ring)) player->ringJump(ring, true);
+            g_engine.simTouchedRing(player, ring);
             return;
         }
         GJBaseGameLayer::playerTouchedRing(player, ring);
@@ -509,21 +579,24 @@ class $modify(SBBase, GJBaseGameLayer) {
 
         ++core.dbg.in[isPlayer1 ? 0 : 1][down ? 0 : 1];
 
-        // Every flag keeps its own lane and its own flag: an event flagged player 2
-        // is a player-2 event (no dual or dual alike), it is never re-tagged as player 1.
-
-        // Two-player / dual: every side has its own input lane.
-        // The wave buffer asks the ghost engine how long this event may be held
-        // back; a held-back event is injected later by the lane.
+        // Wave / Ship / Orb buffer asks the ghost engine how many physics ticks to delay.
         const bool forward = core.onReal(isPlayer1, down, g_engine.sbNext(), [&](bool d) {
             int delay = 0;
             auto& lane = core.lane(isPlayer1);
             if (core.cfg.wave)
                 delay = g_engine.sbWaveDelay(pl, isPlayer1, d, core.p1.gameDown,
                                              core.p2.gameDown, lane.gameDown);
-            if (!delay && core.cfg.ship)
+            if (!delay && core.cfg.ship) {
+                int holdDur = 4, relDur = 5;
+                lane.spamDurations(holdDur, relDur);
                 delay = g_engine.sbShipDelay(pl, isPlayer1, d, core.p1.gameDown,
-                                             core.p2.gameDown, lane.gameDown, lane.halfPeriod());
+                                             core.p2.gameDown, lane.gameDown, holdDur, relDur);
+            }
+            if (!delay && core.cfg.orb && d) {
+                delay = g_engine.sbOrbDelay(pl, isPlayer1, core.p1.gameDown,
+                                            core.p2.gameDown, lane.gameDown,
+                                            core.cfg.orbDelay, core.cfg.orbLookahead);
+            }
             return delay;
         });
         if (forward) {
@@ -547,28 +620,28 @@ class $modify(SBBase, GJBaseGameLayer) {
                     view.valid = true;
                     view.isWave = player->m_isDart;
                     view.isShip = player->m_isShip;
-                    view.buffered = (core.cfg.wave && view.isWave) || (core.cfg.ship && view.isShip);
+                    const bool orbMode = !player->m_isDart && !player->m_isShip;
+                    view.buffered = (core.cfg.wave && view.isWave) ||
+                                    (core.cfg.ship && view.isShip) ||
+                                    (core.cfg.orb && orbMode);
                     view.upsideDown = player->m_isUpsideDown;
                     float x = player->getPositionX();
                     float dx = haveX[i] ? x - lastX[i] : 0.f;
                     if (std::fabs(dx) > 200.f) dx = 0.f; // teleport / restart
                     lastX[i] = x;
                     haveX[i] = true;
-                    // orb rescue: only cube / ball / robot / spider / ufo, only near a zone
-                    const bool orbMode = !player->m_isDart && !player->m_isShip && !player->m_isSwing;
                     if (core.cfg.orb && orbMode && !core.zones.empty()) {
-                        const float margin = std::max(40.f, std::fabs(dx) * 6.f);
+                        const float margin = std::max(45.f, std::fabs(dx) * 8.f);
                         view.orbZone = core.zoneIndex(x, margin);
                         if (view.orbZone >= 0) {
-                            // only when an orb is really close: keeps the ghost off the CPU otherwise
                             const auto& z = core.zones[view.orbZone];
                             const float py = player->getPositionY();
-                            const float hx = 30.f + std::fabs(dx) * 3.f;
+                            const float hx = 36.f + std::fabs(dx) * 4.f;
                             bool closeToOrb = false;
                             for (int k = 0; k < z.count && !closeToOrb; ++k) {
                                 const auto& o = core.orbs[z.first + k];
                                 closeToOrb = x >= o.x0 - hx && x <= o.x1 + hx &&
-                                       py >= o.y0 - 45.f && py <= o.y1 + 45.f;
+                                       py >= o.y0 - 50.f && py <= o.y1 + 50.f;
                             }
                             if (!closeToOrb) view.orbZone = -1;
                         }
@@ -578,10 +651,6 @@ class $modify(SBBase, GJBaseGameLayer) {
                 }
             }
 
-            // Solo: the right-side lane drives the same (only) player. It follows the
-            // player 1 view, and never runs the orb rescue a second time.
-            // No dual: only player 1 exists, so the player-2-flagged lane (right side)
-            // looks at the same player as the player-1 lane.
             core.dual = m_gameState.m_isDualMode && m_player2;
             if (!core.dual) {
                 views[1].valid = views[0].valid;
@@ -605,15 +674,7 @@ class $modify(SBBase, GJBaseGameLayer) {
                 n0 = core.step;
             }
 
-            auto* pl = PlayLayer::get();
-            auto actions = core.onStep(views[0], views[1], [&](bool isP1) {
-                const auto& v = views[isP1 ? 0 : 1];
-                if (v.orbZone < 0 || v.orbZone >= int(core.zones.size())) return false;
-                const auto& z = core.zones[v.orbZone];
-                return g_engine.sbOrbRescue(pl, isP1, core.p1.gameDown, core.p2.gameDown,
-                                            core.lane(isP1).gameDown, core.cfg.orbLookahead,
-                                            core.orbs.data() + z.first, z.count);
-            });
+            auto actions = core.onStep(views[0], views[1]);
             for (int i = 0; i < 2; ++i) {
                 auto const& action = actions[i];
                 if (!action.want) continue;
@@ -621,7 +682,7 @@ class $modify(SBBase, GJBaseGameLayer) {
                 this->handleButton(action.down, 1, i == 0);
                 sb::g_injecting = false;
                 ++core.dbg.inj;
-                core.committed(i == 0, action);
+                core.committed(i == 0, g_engine.sbNow(), action);
             }
         }
         GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
@@ -665,7 +726,7 @@ class $modify(SBPlay, PlayLayer) {
     void setupHasCompleted() {
         PlayLayer::setupHasCompleted();
         sb::refreshCfg();
-        // Orb assist is coming soon: no zone scan
+        buildOrbZones(this);
         auto& core = sb::Core::get();
         core.reset();
         core.active = true;
@@ -734,12 +795,12 @@ class $modify(SBPlay, PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (g_engine.onSimDeath(player)) return;       // ghost player: swallow
+        if (g_engine.onSimDeath(player, object)) return; // ghost player: swallow
         // Capture the lane before the original method mutates player pointers.
         const bool wasPlayer1 = player == m_player1;
         const bool wasPlayer2 = player == m_player2;
         PlayLayer::destroyPlayer(player, object);
-        g_engine.onRealDestroyed(player);              // real death, or one a noclip mod blocked
+        g_engine.onRealDestroyed(player, object);        // real death, or one a noclip mod blocked
         auto& core = sb::Core::get();
         // Collision/death must not cancel FP. Clear only helpers that depend on
         // the old player's current movement/object context, for that side.
@@ -782,9 +843,22 @@ class $modify(SBHardStreak, HardStreak) {
     }
 };
 
+class $modify(SBEnhancedObject, EnhancedGameObject) {
+    static void onModify(auto& self) {
+        (void)self.setHookPriority("EnhancedGameObject::activatedByPlayer", -1000000);
+    }
+
+    void activatedByPlayer(PlayerObject* player) {
+        if (g_engine.isSimulating()) return;
+        EnhancedGameObject::activatedByPlayer(player);
+    }
+};
+
 class $modify(SBEffectObject, EffectGameObject) {
     static void onModify(auto& self) {
         (void)self.setHookPriority("EffectGameObject::triggerObject", -1000000);
+        (void)self.setHookPriority("EffectGameObject::triggerActivated", -1000000);
+        (void)self.setHookPriority("EffectGameObject::playTriggerEffect", -1000000);
     }
 
     void triggerObject(GJBaseGameLayer* p0, int p1, std::vector<int> const* p2) {
@@ -794,6 +868,16 @@ class $modify(SBEffectObject, EffectGameObject) {
         }
         if (m_objectID == 901) g_engine.onRealMoveTrigger(m_duration);   // move trigger
         EffectGameObject::triggerObject(p0, p1, p2);
+    }
+
+    void triggerActivated(float xPosition) {
+        if (g_engine.isSimulating()) return;
+        EffectGameObject::triggerActivated(xPosition);
+    }
+
+    void playTriggerEffect() {
+        if (g_engine.isSimulating()) return;
+        EffectGameObject::playTriggerEffect();
     }
 };
 
@@ -838,19 +922,27 @@ class $modify(SBPlayerObject, PlayerObject) {
 
     void ringJump(RingObject* p0, bool p1) {
         if (g_engine.isSimulating()) {
-            if (!g_engine.isSimPlayer(this)) return;
+            if (!g_engine.isSimPlayer(this) || !p0) return;
+            if (!g_engine.beforeSimRingJump(this, p0)) return;
             // the ghost bounces on the real orb: leave the real orb exactly as it was
             const bool a0 = p0->m_activated;
             const bool a1 = p0->m_activatedByPlayer1;
             const bool a2 = p0->m_activatedByPlayer2;
             const bool a3 = p0->m_isActivated;
             const bool a4 = p0->m_isRingPoweredOn;
+            double vy = m_yVelocity;
+            bool ud = m_isUpsideDown;
+            bool dash = m_isDashing;
+            CCPoint pos = getPosition();
             PlayerObject::ringJump(p0, p1);
             p0->m_activated = a0;
             p0->m_activatedByPlayer1 = a1;
             p0->m_activatedByPlayer2 = a2;
             p0->m_isActivated = a3;
             p0->m_isRingPoweredOn = a4;
+            bool changed = m_yVelocity != vy || m_isUpsideDown != ud ||
+                           m_isDashing != dash || getPosition() != pos;
+            g_engine.afterSimRingJump(this, p0, changed);
             return;
         }
         PlayerObject::ringJump(p0, p1);
@@ -875,8 +967,12 @@ class $modify(SBPlayerObject, PlayerObject) {
     }
 };
 
-// Orbs touched by a ghost player must not flash / pulse on screen.
+// Orbs touched by a ghost player must not flash / pulse / trigger on screen.
 class $modify(SBRingObject, RingObject) {
+    static void onModify(auto& self) {
+        (void)self.setHookPriority("RingObject::triggerActivated", -1000000);
+    }
+
     void powerOnObject(int state) {
         if (g_engine.isSimulating()) return;
         RingObject::powerOnObject(state);
@@ -885,6 +981,11 @@ class $modify(SBRingObject, RingObject) {
     void spawnCircle() {
         if (g_engine.isSimulating()) return;
         RingObject::spawnCircle();
+    }
+
+    void triggerActivated(float xPosition) {
+        if (g_engine.isSimulating()) return;
+        RingObject::triggerActivated(xPosition);
     }
 };
 
